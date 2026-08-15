@@ -1,0 +1,73 @@
+# Gold set: the question, and the SQL a careful analyst would write.
+#
+# Scoring is EXECUTION ACCURACY — we run the gold SQL, run the agent's SQL, and
+# compare the RESULTS. Never the SQL text: there are many correct queries for
+# one question, and grading text would punish the agent for being different
+# rather than wrong.
+#
+# Write these by hand BEFORE trusting the agent. The point is that "correct" is
+# defined by you, not by the thing being graded.
+
+- id: revenue_delivered
+  question: What is the total revenue from delivered orders?
+  gold: |
+    SELECT ROUND(SUM(oi.price), 2) AS total_revenue
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.order_id
+    WHERE o.order_status = 'delivered'
+
+- id: delivered_count
+  question: How many orders were delivered?
+  gold: |
+    SELECT COUNT(*) AS delivered_orders
+    FROM orders WHERE order_status = 'delivered'
+
+- id: worst_category
+  question: Which product category has the worst average review score?
+  ordered: true
+  gold: |
+    SELECT t.product_category_name_english AS category
+    FROM order_reviews r
+    JOIN orders o ON r.order_id = o.order_id
+    JOIN order_items oi ON o.order_id = oi.order_id
+    JOIN products p ON oi.product_id = p.product_id
+    JOIN product_category_name_translation t
+      ON p.product_category_name = t.product_category_name
+    GROUP BY t.product_category_name_english
+    ORDER BY AVG(r.review_score) ASC
+    LIMIT 1
+
+- id: top5_states
+  question: Top 5 states by number of delivered orders
+  ordered: true
+  gold: |
+    SELECT c.customer_state AS state, COUNT(*) AS orders
+    FROM orders o JOIN customers c ON o.customer_id = c.customer_id
+    WHERE o.order_status = 'delivered'
+    GROUP BY c.customer_state
+    ORDER BY orders DESC LIMIT 5
+
+- id: avg_review
+  question: What is the average review score across all reviews?
+  gold: |
+    SELECT ROUND(AVG(review_score), 2) AS avg_score FROM order_reviews
+
+- id: common_payment
+  question: Which payment type is used most often?
+  ordered: true
+  gold: |
+    SELECT payment_type FROM order_payments
+    GROUP BY payment_type ORDER BY COUNT(*) DESC LIMIT 1
+
+- id: seller_count
+  question: How many distinct sellers sold at least one item?
+  gold: |
+    SELECT COUNT(DISTINCT seller_id) AS sellers FROM order_items
+
+- id: freight_delivered
+  question: What is the total freight value paid on delivered orders?
+  gold: |
+    SELECT ROUND(SUM(oi.freight_value), 2) AS total_freight
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.order_id
+    WHERE o.order_status = 'delivered'

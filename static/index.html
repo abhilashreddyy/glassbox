@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>glassbox — data analyst agent</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --ink:#12141a; --muted:#6b7280; --line:#e5e7eb;
+    --accent:#2563eb; --ok:#10a35f; --bad:#dc2626; --warn:#b45309;
+    --code:#f3f4f6; --shadow:0 1px 3px rgba(0,0,0,.06),0 8px 24px rgba(0,0,0,.04);
+  }
+  @media (prefers-color-scheme:dark){
+    :root{ --bg:#0e1014; --panel:#161a21; --ink:#e8eaee; --muted:#98a2b3; --line:#262c36;
+           --accent:#5b8dff; --ok:#3ddc97; --bad:#ff6b6b; --warn:#f0b429;
+           --code:#0f1319; --shadow:0 1px 3px rgba(0,0,0,.4); }
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font:15px/1.55 ui-sans-serif,-apple-system,"Segoe UI",Roboto,sans-serif}
+  code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+  header{padding:22px 28px 14px;border-bottom:1px solid var(--line);background:var(--panel)}
+  h1{margin:0;font-size:19px;letter-spacing:-.2px}
+  h1 span{color:var(--muted);font-weight:400}
+  .models{margin-top:8px;display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+  .models b{color:var(--ink);font-weight:600}
+  main{max-width:1180px;margin:0 auto;padding:22px 28px 60px}
+  .ask{display:flex;gap:10px;margin-bottom:12px}
+  input{flex:1;padding:13px 15px;border:1px solid var(--line);border-radius:10px;
+    background:var(--panel);color:var(--ink);font-size:15px;box-shadow:var(--shadow)}
+  input:focus{outline:2px solid var(--accent);outline-offset:-1px}
+  button{padding:13px 22px;border:0;border-radius:10px;background:var(--accent);
+    color:#fff;font-size:15px;font-weight:600;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .examples{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:22px}
+  .chip{padding:6px 11px;border:1px solid var(--line);border-radius:999px;background:var(--panel);
+    color:var(--muted);font-size:12.5px;cursor:pointer}
+  .chip:hover{color:var(--ink);border-color:var(--accent)}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:900px){.cols{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:16px 18px;box-shadow:var(--shadow);margin-bottom:18px}
+  .card h2{margin:0 0 12px;font-size:12px;text-transform:uppercase;letter-spacing:.09em;color:var(--muted)}
+  pre{margin:0;background:var(--code);padding:12px;border-radius:8px;overflow-x:auto;
+    font-size:12.5px;line-height:1.5;white-space:pre-wrap;word-break:break-word}
+  .step{display:flex;gap:11px;padding:9px 0;border-bottom:1px solid var(--line)}
+  .step:last-child{border-bottom:0}
+  .dot{width:9px;height:9px;border-radius:50%;margin-top:6px;flex:none;background:var(--accent)}
+  .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+  .step .body{flex:1;min-width:0}
+  .step .name{font-size:12px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+  .step .meta{font-size:11.5px;color:var(--muted);margin-top:2px}
+  .step .detail{font-size:13px;margin-top:6px;color:var(--muted)}
+  table{border-collapse:collapse;width:100%;font-size:12.5px;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:6px 9px;text-align:left;white-space:nowrap}
+  th{background:var(--code);font-weight:600}
+  .answer{font-size:16px;line-height:1.6}
+  .totals{display:flex;gap:20px;flex-wrap:wrap;font-size:12.5px;color:var(--muted);margin-top:10px}
+  .totals b{color:var(--ink)}
+  .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:700}
+  .badge.ok{background:rgba(16,163,95,.14);color:var(--ok)}
+  .badge.bad{background:rgba(220,38,38,.14);color:var(--bad)}
+  details summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+  .empty{color:var(--muted);font-size:13.5px}
+</style>
+</head>
+<body>
+<header>
+  <h1>glassbox <span>— a data analyst agent that shows its work</span></h1>
+  <div class="models" id="models"></div>
+</header>
+
+<main>
+  <div class="ask">
+    <input id="q" placeholder="Ask a question about the e-commerce data…"
+           autocomplete="off">
+    <button id="go">Ask</button>
+  </div>
+  <div class="examples" id="examples"></div>
+
+  <div class="cols">
+    <div>
+      <div class="card">
+        <h2>Process</h2>
+        <div id="steps"><div class="empty">Ask something to watch the agent work.</div></div>
+      </div>
+    </div>
+    <div>
+      <div class="card">
+        <h2>Answer</h2>
+        <div id="answer" class="answer empty">—</div>
+        <div class="totals" id="totals"></div>
+      </div>
+      <div class="card">
+        <h2>Final SQL</h2>
+        <pre id="sql">—</pre>
+      </div>
+      <div class="card">
+        <h2>Result</h2>
+        <div id="table" class="empty">—</div>
+      </div>
+      <div class="card">
+        <h2>Schema</h2>
+        <details><summary>show tables</summary><pre id="schema"></pre></details>
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let source = null;
+
+fetch('/api/meta').then(r => r.json()).then(m => {
+  $('models').innerHTML =
+    Object.entries(m.models).map(([k,v]) => `${k}: <b>${v}</b>`).join('')
+    + ` &nbsp;·&nbsp; data: <b>${m.data_mode}</b>`;
+  $('schema').textContent = m.schema;
+  $('examples').innerHTML = m.examples
+    .map(e => `<span class="chip">${e}</span>`).join('');
+  document.querySelectorAll('.chip').forEach(c =>
+    c.onclick = () => { $('q').value = c.textContent; ask(); });
+});
+
+function esc(s){ return String(s ?? '').replace(/[&<>]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+function step(name, dotClass, meta, detailHtml){
+  const d = document.createElement('div');
+  d.className = 'step';
+  d.innerHTML = `<div class="dot ${dotClass||''}"></div><div class="body">
+      <div class="name">${esc(name)}</div>
+      ${meta ? `<div class="meta">${esc(meta)}</div>` : ''}
+      ${detailHtml || ''}</div>`;
+  $('steps').appendChild(d);
+}
+
+function renderTable(cols, rows){
+  if(!cols || !cols.length) return;
+  const head = cols.map(c => `<th>${esc(c)}</th>`).join('');
+  const body = rows.map(r => `<tr>${r.map(v =>
+      `<td>${esc(v === null ? 'NULL' : v)}</td>`).join('')}</tr>`).join('');
+  $('table').className = '';
+  $('table').innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function ask(){
+  const q = $('q').value.trim();
+  if(!q) return;
+  if(source) source.close();
+  $('steps').innerHTML = '';
+  $('answer').textContent = 'thinking…'; $('answer').className = 'answer empty';
+  $('sql').textContent = '—';
+  $('table').innerHTML = '—'; $('table').className = 'empty';
+  $('totals').innerHTML = ''; $('go').disabled = true;
+
+  source = new EventSource('/api/ask?q=' + encodeURIComponent(q));
+
+  source.addEventListener('node', e => {
+    const v = JSON.parse(e.data);
+    const u = v.usage ? `${v.usage.model} · ${v.usage.in}→${v.usage.out} tok · ${v.usage.secs}s` : '';
+    if(v.node === 'write_sql'){
+      step(`write_sql (attempt ${v.attempt})`, '', u, `<pre>${esc(v.sql)}</pre>`);
+      $('sql').textContent = v.sql;
+    } else if(v.node === 'execute'){
+      step('execute', v.ok ? 'ok' : 'bad',
+           v.ok ? `${v.rows} rows in ${v.secs}s` : 'query failed',
+           v.ok ? '' : `<div class="detail">${esc(v.error)}</div>`);
+      if(v.ok) renderTable(v.columns, v.data);
+    } else if(v.node === 'verify'){
+      step('verify', v.verdict === 'ok' ? 'ok' : 'bad', u,
+        `<div class="detail"><span class="badge ${v.verdict}">${v.verdict}</span>
+         ${esc(v.reason)}</div>`);
+    } else if(v.node === 'revise'){
+      step('revise', 'warn', v.why, `<div class="detail">${esc(v.detail)}</div>`);
+    } else if(v.node === 'nudge'){
+      step('nudge — repeated SQL blocked', 'warn', '',
+           `<div class="detail">Same query as a previous attempt; forcing a new approach.</div>`);
+    } else if(v.node === 'answer'){
+      step('answer', 'ok', u, '');
+    }
+  });
+
+  source.addEventListener('done', e => {
+    const d = JSON.parse(e.data);
+    $('answer').textContent = d.answer || '—';
+    $('answer').className = 'answer';
+    if(d.sql) $('sql').textContent = d.sql;
+    const t = d.totals || {};
+    $('totals').innerHTML =
+      `<span>llm calls <b>${t.llm_calls||0}</b></span>
+       <span>tokens in <b>${(t.in||0).toLocaleString()}</b></span>
+       <span>out <b>${(t.out||0).toLocaleString()}</b></span>
+       <span>model time <b>${(t.secs||0).toFixed(1)}s</b></span>
+       ${d.verdict ? `<span class="badge ${d.verdict}">verified: ${d.verdict}</span>` : ''}`;
+    $('go').disabled = false; source.close();
+  });
+
+  source.addEventListener('error', e => {
+    let msg = 'stream error';
+    try { msg = JSON.parse(e.data).error; } catch(_){}
+    step('error', 'bad', '', `<div class="detail">${esc(msg)}</div>`);
+    $('answer').textContent = '—'; $('go').disabled = false;
+    if(source) source.close();
+  });
+}
+
+$('go').onclick = ask;
+$('q').addEventListener('keydown', e => { if(e.key === 'Enter') ask(); });
+</script>
+</body>
+</html>
