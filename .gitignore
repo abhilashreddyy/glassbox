@@ -3,3 +3,4 @@ __pycache__/
 data/*.duckdb
 data/olist/
 data/profile.json
+eval_run.log

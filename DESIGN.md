@@ -77,28 +77,33 @@ Build order is at the end.
 Correct SQL is impossible against values you have never seen. The agent is given
 its grounding in three tiers, cheapest first.
 
-**Tier 1 — schema.** Every table, column and type, injected once (~500 tokens).
-All 8 tables at once, because a model that sees the whole schema writes better
-joins than one discovering it a table at a time.
+**Tier 1 — schema.** Every table, column and type, injected once. All 9 tables at
+once, because a model that sees the whole schema writes better joins than one
+discovering it a table at a time.
 
-**Tier 2 — value profiles.** Computed when the database is built, pasted into the
-same text. Deterministic, no LLM call:
+**Tier 2 — value profiles.** Computed when the database is built (`profile_db.py`),
+pasted into the same text. Deterministic, no LLM call:
 
 ```
-orders (3,000 rows)
-  order_status VARCHAR    — delivered(2,730), shipped(120), canceled(90), processing(60)
-  order_purchase_timestamp TIMESTAMP — 2017-01-01 … 2018-12-31
-products (200 rows)
-  product_category_name VARCHAR — 8 values: cama_mesa_banho, beleza_saude, moveis_decoracao, …
+orders (99,441 rows)
+  order_status VARCHAR  = delivered(96,478), shipped(1,107), canceled(625),
+                          unavailable(609), invoiced(314), processing(301), …
+  order_purchase_timestamp TIMESTAMP  range 2016-09-04 … 2018-10-17
+  order_delivered_customer_date TIMESTAMP  range 2016-10-11 … 2018-10-17  3.0% null
+products (32,951 rows)
+  product_category_name VARCHAR  73 distinct, common: cama_mesa_banho,
+                          esporte_lazer, moveis_decoracao, …  1.9% null
 ```
 
-Rule: if `COUNT(DISTINCT) ≤ 25`, list the values; for dates and numbers, give
-min/max. About 300 extra tokens, and it removes an entire class of failure.
+Rule: if `COUNT(DISTINCT) ≤ 25`, list every value with counts; between 25 and 300,
+name the commonest few; for dates and numbers, give min/max. Null rates
+throughout. ~1,000 tokens for the whole database, and it removes an entire class
+of failure.
 
 > **Why this exists.** Asked for *"top 3 spending customers in the last few
 > months"*, the agent filtered `>= current_date - INTERVAL 3 months`. The data
-> ends in 2018. Zero rows, and it had no way to know. A date range in the profile
-> makes that mistake unwritable.
+> ends 2018-10-17. Zero rows, and it had no way to know. With the range in the
+> profile it now anchors to 2018-07-17 … 2018-10-17 and returns three customers.
 
 **Tier 3 — on-demand resolution.** Thousands of cities can't be listed, so
 high-cardinality values are resolved against the database when a question needs
@@ -120,10 +125,17 @@ ask the user; zero → the answer is already known before any real query exists.
 guessed, and not asked about either.
 
 > **Why this exists.** Asked for *"total revenue from delivered orders"*, the
-> agent summed `order_payments.payment_value` → 1,287,361.10 where the gold sums
-> `order_items.price` → 1,202,737.26. The difference is freight. Both are
-> defensible SQL; the disagreement is over what *revenue means*. Stating it in a
-> prompt wasn't enough — the agent ignored it.
+> agent summed `order_payments.payment_value` → 15,422,461.77 where the gold sums
+> `order_items.price` → 13,221,498.11. The difference is freight. Both are
+> defensible SQL; the disagreement is over what *revenue means*. Stating the rule
+> in the system prompt was not enough — the agent ignored it through three
+> attempts. As a glossary entry sent to the writer *and* the verifier, it passes
+> first try.
+>
+> Every failure this project has produced has been definitional like this, not
+> syntactic: the query runs, and answers a slightly different question. Three
+> more — which date defines a "month", whether two hours counts as "late",
+> whether a "share" is 41.3 or 0.41 — were each fixed by one glossary line.
 
 ---
 
@@ -358,7 +370,11 @@ while a local one keeps the easy step — then measure whether it was worth it.
 | 8 | Permissions enforced in `tools.py` | for a real deployment |
 | 9 | Hybrid text + SQL over the 41% of reviews with comments | the "why" questions |
 
-Measure every step against `eval/run_eval.py`. Current baseline: **7/8 (87.5%)**
+Measure every step against `eval/run_eval.py`. Current: **17/17** — but see the
+caveat in the README: three of those were fixed by glossary entries written
+after seeing them fail, so the honest next step is a held-out question set.
+
+Previous baselines: **7/8 (87.5%)**
 execution accuracy, all three roles on local `gpt-oss:20b`.
 
 One open question worth an experiment rather than an opinion: **does a plan step

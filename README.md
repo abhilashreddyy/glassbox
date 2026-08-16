@@ -127,13 +127,28 @@ Two numbers, and the gap between them is the interesting one:
 
 ## Results
 
-17 gold questions, all three roles on local `gpt-oss:20b`, real Olist data.
+All three roles on local `gpt-oss:20b`, real Olist data, on a 24 GB Mac.
 
 | Stage | Accuracy |
 |---|---|
-| 8 questions, no grounding | 7/8 = 87.5% |
-| 17 questions, no grounding | — |
-| 17 questions, + profile + glossary + checks | see `eval/` output |
+| 8 questions, schema only | 7/8 = 87.5% |
+| 17 questions, schema only | 14/17 = 82.4% |
+| 17 questions, + profiles + glossary + checks | **17/17 = 100%** |
+
+### Read that 100% with suspicion
+
+Three of those seventeen were failing until I added three glossary entries —
+written *after seeing exactly which questions failed and why*. That is fitting
+to the test set, and a number produced that way is not a measure of how the
+agent handles a question it has never met.
+
+What it does honestly show: **every failure was definitional, and a definition
+fixed it.** The mechanism works. What it does not show is the hit rate on
+unseen questions.
+
+The clean measurement is a held-out set: write new questions without looking at
+any failure, run once, report that. Until then, treat 100% as "the known
+failure modes are closed", not as accuracy.
 
 ### What the failures taught us
 
