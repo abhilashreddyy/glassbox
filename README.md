@@ -3,17 +3,21 @@
 **A data analyst agent that shows its work.**
 
 Ask a business question in English. The agent writes SQL, runs it, *checks its
-own answer*, revises when the check fails, and reports the result — with every
-step, every token and every revision visible in the UI.
+own answer*, diagnoses empty results instead of shrugging at them, revises when
+a check fails, and reports back — with every step, every token and every
+revision visible in the UI.
 
 Most text-to-SQL demos show you an answer. This one shows you why it believes
 the answer, and admits when it doesn't.
 
 ```
-START → write_sql → (repeat? → nudge ↩) → execute ─ok→ verify ─ok→ answer → END
-            ▲                                 │            │
-            └──── revise (error / critique) ──┴────────────┘   (attempts ≤ 3)
+START → write_sql → (repeat? → nudge ↩) → execute ─rows→ verify ─ok→ answer → END
+            ▲                              │  │                │
+            │                              │  └─0 rows→ diagnose_empty
+            └─────────── revise ───────────┴───────────┴────────┘  (attempts ≤ 3)
 ```
+
+See [DESIGN.md](DESIGN.md) for how it works.
 
 ## Run it
 
@@ -26,31 +30,69 @@ START → write_sql → (repeat? → nudge ↩) → execute ─ok→ verify ─o
 .venv/bin/python eval/run_eval.py -k 3   # 3 runs each — measures reliability
 ```
 
-First run builds `data/olist.duckdb` automatically.
-
 ## The data
 
-Eight relational tables shaped exactly like the Kaggle **Brazilian E-Commerce
-(Olist)** dataset: `orders`, `order_items`, `customers`, `products`, `sellers`,
-`order_payments`, `order_reviews`, `product_category_name_translation`.
+The real **Brazilian E-Commerce (Olist)** dataset from Kaggle — 9 tables:
 
-Real joins are the point — a single flat table gives the agent nothing to
-decide, and an agent that isn't deciding is just a prompt.
+| Table | Rows | |
+|---|---|---|
+| orders | 99,441 | 5-stage delivery funnel timestamps |
+| order_items | 112,650 | price and freight per item |
+| order_reviews | 99,224 | 1–5 score, **41% carry Portuguese free text** |
+| order_payments | 103,886 | type, instalments, value |
+| customers | 99,441 | zip prefix, city, state |
+| products | 32,951 | category, weight, dimensions |
+| sellers | 3,095 | zip prefix, city, state |
+| geolocation | 1,000,163 | lat/lng per zip prefix |
+| category translation | 71 | Portuguese → English |
 
-Without Kaggle credentials the loader generates a synthetic dataset with the
-same schema, so everything runs today. **To use the real data**, download the
-dataset from Kaggle and drop the CSVs into `data/olist/`, then:
+Data spans 2016-09-04 to 2018-10-17. Real joins are the point — a single flat
+table gives the agent nothing to decide, and an agent that isn't deciding is
+just a prompt.
+
+**To rebuild from scratch:** put a Kaggle token at `~/.kaggle/kaggle.json` (or
+export `KAGGLE_API_TOKEN`), then:
 
 ```bash
-.venv/bin/python db.py     # rebuilds; detects real CSVs automatically
+.venv/bin/kaggle datasets download -d olistbr/brazilian-ecommerce -p data/olist --unzip
+.venv/bin/python db.py && .venv/bin/python profile_db.py
 ```
 
-Gold answers in `eval/questions.yaml` are written against the synthetic data —
-recompute them after switching.
+`db.py` falls back to generating a synthetic dataset with identical table and
+column names if no CSVs are present, so the project runs without credentials.
+
+## What the agent is given
+
+Three layers of grounding, cheapest first — because correct SQL is impossible
+against values you have never seen.
+
+1. **Schema** — tables, columns, types.
+2. **Value profile** (`profile_db.py`) — computed once at build time, no LLM:
+   every low-cardinality column's actual values with counts, min/max for dates
+   and numbers, null rates. ~1,000 tokens.
+   ```
+   order_status VARCHAR = delivered(96,478), shipped(1,107), canceled(625), …
+   order_purchase_timestamp TIMESTAMP range 2016-09-04 … 2018-10-17
+   ```
+3. **Glossary** (`glossary.yaml`) — house definitions of business terms, sent to
+   the writer *and* the verifier. Revenue means `order_items.price`, "sold"
+   means delivered, "share" means 0–100 not 0–1.
+
+## Verification
+
+Three layers, cheapest and least fallible first:
+
+1. **The database** — SQL that doesn't parse is rejected in milliseconds, and
+   DuckDB's error names the offending token. It's fed back verbatim.
+2. **Deterministic checks** (`checks.py`) — no model involved:
+   - **precheck**, before running: a query anchored to `current_date` against
+     data that ended years ago cannot match anything. Caught pre-execution.
+   - **diagnose**, after 0 rows: drop one AND-ed filter at a time and see where
+     rows reappear, which localizes the emptiness to a specific condition.
+3. **The LLM verifier** — last, for the part needing judgment, and given the
+   glossary so it has a rulebook rather than an opinion.
 
 ## Models are configurable per role
-
-Three roles, genuinely different difficulty, so they don't need the same model:
 
 | Role | Job | Difficulty |
 |---|---|---|
@@ -61,83 +103,94 @@ Three roles, genuinely different difficulty, so they don't need the same model:
 ```bash
 export DATA_AGENT_MODEL_DEFAULT=ollama:gpt-oss:20b            # everything local
 export DATA_AGENT_MODEL_SQL_WRITER=anthropic:claude-sonnet-5  # upgrade one role
-export DATA_AGENT_MODEL_VERIFIER=openai:gpt-4o-mini
 ```
 
-Format is `provider:model` (`ollama`, `openai`, `anthropic`). API providers need
-their package installed (`uv pip install langchain-anthropic`) and the usual key
-in the environment. The UI shows which model produced every run, so
-*"how much model does each part actually need?"* is a measurable question:
-change one role, rerun the eval, compare.
+Format is `provider:model` (`ollama`, `openai`, `anthropic`); API providers need
+their package (`uv pip install langchain-anthropic`) and the usual key. The UI
+shows which model produced every run, so *"how much model does each part
+actually need?"* is measurable: change one role, rerun the eval, compare.
 
 ## How it's scored
 
-**Execution accuracy.** For each question a human-written gold SQL is run, the
-agent's SQL is run, and the *results* are compared — never the SQL text, since
-many correct queries answer one question.
+**Execution accuracy.** A human-written gold SQL is run, the agent's SQL is run,
+and the *results* are compared — never the SQL text, since many correct queries
+answer one question.
 
 Matching rules: numeric tolerance, column names ignored, row order ignored
-unless the question is a ranking, and gold values must appear in the agent's
-rows (extra columns are fine, but the row count must match so nothing passes by
+unless the question is a ranking, and gold values must appear in the agent's rows
+(extra columns are fine, but the row count must match so nothing passes by
 dumping the whole table).
 
 Two numbers, and the gap between them is the interesting one:
 - **accuracy** — share of runs that matched gold
 - **pass^k** — share of questions correct on *every* run
 
-## Baseline (all three roles on gpt-oss:20b, local)
+## Results
 
-| Metric | Value |
+17 gold questions, all three roles on local `gpt-oss:20b`, real Olist data.
+
+| Stage | Accuracy |
 |---|---|
-| accuracy | 7/8 = 87.5% |
-| pass^1 | 7/8 = 87.5% |
-| wall clock | 168s for 8 questions |
+| 8 questions, no grounding | 7/8 = 87.5% |
+| 17 questions, no grounding | — |
+| 17 questions, + profile + glossary + checks | see `eval/` output |
 
-### What the failure taught us
+### What the failures taught us
 
-`revenue_delivered` failed — and **the verifier passed it anyway**. That is the
-false-success case, the thing this project exists to study.
+Every failure this project has produced has been **definitional, not syntactic**.
+The SQL runs; it answers a slightly different question.
 
-The agent summed `order_payments.payment_value` (1,287,361.10); the gold sums
-`order_items.price` (1,202,737.26). The difference is freight. Both queries are
-defensible SQL — the disagreement is over what "revenue" *means*, and the system
-prompt already states the house definition. The agent ignored it, and a verifier
-looking only at question + SQL + result had no way to see the violation.
+- *"total revenue from delivered orders"* — the agent summed
+  `order_payments.payment_value` (15,422,461.77) where an analyst means
+  `order_items.price` (13,221,498.11). The difference is freight. Stating the
+  rule in the system prompt was not enough; it took a glossary entry sent to
+  both the writer and the verifier.
+- *"how many distinct sellers sold at least one item"* — the agent applied the
+  glossary's definition of "sold" (delivered only, 2,970) while the gold SQL
+  ignored it (3,095). **The eval was wrong, not the agent.** Kept as a test that
+  definitions are actually applied.
+- *"which calendar month had the highest revenue"* — grouped by delivery date
+  instead of purchase date.
+- *"average review score for late deliveries"* — used `date_diff(day) > 0`,
+  making an order two hours late count as on time.
+- *"what share of reviews include a comment"* — returned 0.41 where the gold
+  wanted 41.3.
 
-Two conclusions worth more than the score: business-term ambiguity is the real
-enemy in text-to-SQL, not syntax; and a verifier that can't see the rules can't
-enforce them.
+The last three were fixed by adding three glossary entries. That is the whole
+thesis of the project in one experiment: **business-term ambiguity is the enemy,
+and the fix is a lookup both the writer and the checker can see** — not a
+smarter model, and not a longer prompt.
 
-Also observed live: a run where the model aliased `order_reviews AS or` — a
-reserved word — DuckDB rejected it, the error was fed back, and attempt 2 fixed
-the alias. Error-driven revision works.
+Also observed: a run where the model aliased `order_reviews AS or` — a reserved
+word — DuckDB rejected it, the error fed back, and attempt 2 fixed the alias.
+Error-driven revision works.
 
 ## Layout
 
 ```
+graph.py          the agent — nodes, routers, guarded cycles
+tools.py          read-only SQL + schema text
+profile_db.py     value profiles: what the schema doesn't say
+checks.py         deterministic verification (precheck, diagnose)
+glossary.yaml     house definitions of business terms
+db.py             builds DuckDB from Olist CSVs (or synthetic)
 config.py         model routing per role
-db.py             builds DuckDB (real Olist CSVs or synthetic)
-tools.py          schema introspection + read-only SQL runner
-graph.py          the LangGraph agent — nodes, routers, guarded cycles
 server.py         FastAPI + SSE: streams each node to the browser
 static/index.html the glass-box UI
 eval/             gold questions + execution-accuracy harness
 ```
 
-Safety by construction: the connection is **read-only**, DDL/DML is rejected,
-and results are row-capped. The database has to stay trustworthy — it's the
-oracle everything is graded against.
+Safety by construction: the connection is **read-only**, DDL/DML is rejected, and
+results are row-capped. The database has to stay trustworthy — it's the oracle
+everything is graded against.
 
-## Roadmap
+## Next
 
-1. **Give the verifier the rulebook.** It currently sees question + SQL +
-   result. Add the metric definitions (what "revenue" means, which status
-   counts as a sale) so it can catch the definitional failure above.
-2. **A business-glossary tool** so the writer resolves terms instead of guessing.
-3. **Row/column-level permissions.** A `profile` on each request that restricts
-   which tables and columns are visible, enforced in `tools.py` — not by asking
-   the model nicely. The right shape for a real deployment: an analyst sees
-   salaries, a support agent doesn't.
-4. **More questions.** Eight is enough to prove the harness; twenty with harder
-   joins, window functions and date math is enough to trust the number.
-5. **Charts** for results with a natural visual form.
+1. `plan` + `resolve` nodes — probe the data to pin ambiguous values before
+   writing SQL, instead of guessing and revising.
+2. `clarify` via `interrupt()` — ask the user only when the answer would
+   materially change, stating the facts while asking.
+3. Row/column permissions enforced in `tools.py`, with the schema filtered
+   before the model sees it.
+4. Hybrid text + SQL: 41% of reviews carry Portuguese comments, which is the
+   only way to answer *why* a category is rated badly.

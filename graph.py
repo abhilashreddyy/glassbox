@@ -1,30 +1,56 @@
 """The agent: question in, verified answer out.
 
-    START → write_sql → (repeat? → nudge ↩) → execute ─ok→ verify ─ok→ answer → END
-                ▲                                 │            │
-                └──── revise (error/critique) ────┴────────────┘   (attempts ≤ 3)
+    START → write_sql → (repeat? → nudge ↩) → execute ─rows→ verify ─ok→ answer
+                ▲                               │  │                │
+                │                               │  └─0 rows→ diagnose_empty
+                └──────────── revise ───────────┴────────────┴───────┘
+                                                        (attempts ≤ 3)
 
-Two cycles, both guarded by `attempts`:
-  1. SQL errored        → feed DuckDB's own message back and rewrite
-  2. SQL ran but is wrong → the verifier's critique goes back and rewrites
+Every path back to write_sql goes through one `revise` node, which reads
+whatever the detecting node left in `pending`. Four things can send it there:
 
-The verify node is the point of the project. Anyone can prompt a model for SQL;
-the interesting engineering is deciding whether the result actually answers the
-question, and doing something about it when it doesn't.
+  1. precheck   a query that provably cannot match (caught before running it)
+  2. sql error  DuckDB's own message, verbatim
+  3. diagnosis  which filter emptied the result, with row counts
+  4. critique   the verifier rejected a result that ran fine
+
+The order is deliberate: 1–3 are decided by code, and only 4 asks a model.
+Anything the database can settle is settled before an opinion is consulted.
 """
 
 import json
 import re
 import time
+from pathlib import Path
 from typing import Annotated, Optional, TypedDict
 
+import yaml
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
+import checks
 import tools
 from config import get_model, model_name
 
 MAX_ATTEMPTS = 3
+ROOT = Path(__file__).resolve().parent
+
+
+def _load_glossary() -> str:
+    """House definitions of business terms, rendered for the prompt.
+
+    Goes to the writer AND the verifier: the rule is stated where the query is
+    written, and again where it is checked. A rule only the writer sees is a
+    rule the checker cannot enforce.
+    """
+    path = ROOT / "glossary.yaml"
+    if not path.exists():
+        return ""
+    terms = yaml.safe_load(path.read_text()) or {}
+    return "\n".join(f"- {k}: {v.strip()}" for k, v in terms.items())
+
+
+GLOSSARY = _load_glossary()
 
 
 # ── state ───────────────────────────────────────────────────────────────────
@@ -37,13 +63,15 @@ class S(TypedDict):
     schema: str
     sql: Optional[str]
     result: Optional[dict]
-    verdict: Optional[str]          # "ok" | "bad"
-    critique: Optional[str]         # why the verifier rejected it
-    feedback: Annotated[list, append]   # everything learned this run, fed back
+    verdict: Optional[str]              # "ok" | "bad"
+    critique: Optional[str]
+    diagnosis: Optional[dict]           # why a result was empty
+    pending: Optional[list]             # what the next revise should say
+    feedback: Annotated[list, append]   # everything learned this run
     tried: Annotated[list, append]      # SQL fingerprints already attempted
     attempts: int
     answer: Optional[str]
-    events: Annotated[list, append]     # what the UI renders (the glass box)
+    events: Annotated[list, append]     # what the UI renders
 
 
 def _norm(sql: str) -> str:
@@ -61,12 +89,8 @@ def _call(role: str, system: str, user: str) -> tuple[str, dict]:
     t0 = time.time()
     msg = get_model(role).invoke([SystemMessage(system), HumanMessage(user)])
     u = getattr(msg, "usage_metadata", None) or {}
-    usage = {
-        "model": model_name(role),
-        "in": u.get("input_tokens", 0),
-        "out": u.get("output_tokens", 0),
-        "secs": round(time.time() - t0, 2),
-    }
+    usage = {"model": model_name(role), "in": u.get("input_tokens", 0),
+             "out": u.get("output_tokens", 0), "secs": round(time.time() - t0, 2)}
     text = msg.content if isinstance(msg.content, str) else str(msg.content)
     return text.strip(), usage
 
@@ -85,41 +109,51 @@ WRITE_SYS = """You are a senior data analyst. Write ONE DuckDB SQL query that an
 
 Rules:
 - Output only the SQL in a ```sql code block. No explanation.
-- Use only the tables and columns in the schema. Never invent names.
+- Use only the tables and columns given. Never invent names.
+- The schema lists each column's actual VALUES and RANGES — use them. Never
+  filter on a value that is not in the data.
 - Prefer explicit JOINs. Alias aggregates with clear names (e.g. AS total_revenue).
-- Revenue means order_items.price unless the question says otherwise; freight is separate.
-- Category names are Portuguese; join product_category_name_translation for English.
-- If the question implies completed sales, filter orders.order_status = 'delivered'.
-- Add ORDER BY and LIMIT when the question asks for "top"/"worst"/"best" N."""
+- Never alias a table with a reserved word (or, is, in, as...).
+- Add ORDER BY and LIMIT when the question asks for "top"/"worst"/"best" N.
+
+DEFINITIONS — these are the house meanings of business terms. Follow them
+exactly, even if another reading seems reasonable:
+{glossary}"""
 
 
 def write_sql(state: S) -> dict:
-    parts = [f"Schema:\n{state['schema']}", f"\nQuestion: {state['question']}"]
+    parts = [f"Schema and data profile:\n{state['schema']}",
+             f"\nQuestion: {state['question']}"]
     if state.get("feedback"):
-        parts.append(
-            "\nPrevious attempts failed. Fix these problems:\n"
-            + "\n".join(f"- {f}" for f in state["feedback"][-4:])
-        )
-    text, usage = _call("sql_writer", WRITE_SYS, "\n".join(parts))
+        parts.append("\nPrevious attempts failed. Fix these problems:\n"
+                     + "\n".join(f"- {f}" for f in state["feedback"][-4:]))
+
+    text, usage = _call("sql_writer",
+                        WRITE_SYS.format(glossary=GLOSSARY or "(none)"),
+                        "\n".join(parts))
     sql = _extract_sql(text)
+
+    # Deterministic gate: catch a query that cannot match before spending a
+    # database round trip and, more importantly, before the result gets
+    # rationalised downstream.
+    problems = checks.precheck_sql(sql)
     return {
         "sql": sql,
+        "pending": problems or None,
         "events": [_ev("write_sql", sql=sql, usage=usage,
-                       attempt=state.get("attempts", 0) + 1)],
+                       attempt=state.get("attempts", 0) + 1,
+                       precheck=problems or None)],
     }
 
 
 def nudge(state: S) -> dict:
-    """Same SQL twice. The model can't see its own repetition as a problem —
-    so code notices and edits the prompt. (Proven in the tau2 replay: identical
-    context repeats forever; one explicit line changes the output.)"""
+    """Same SQL twice. The model cannot see its own repetition as a problem, so
+    code notices and edits the prompt instead of re-running a known query."""
     return {
         "attempts": state["attempts"] + 1,
-        "feedback": [
-            f"You already tried this exact query and it did not work: {state['sql']} "
-            "Do NOT submit it again. Change the approach — different joins, "
-            "different filters, or a different aggregation."
-        ],
+        "feedback": [f"You already tried this exact query and it did not work: "
+                     f"{state['sql']} Do NOT submit it again. Change the "
+                     f"approach — different joins, filters, or aggregation."],
         "events": [_ev("nudge", sql=state["sql"])],
     }
 
@@ -130,30 +164,57 @@ def execute(state: S) -> dict:
     ev = _ev("execute", ok=result["ok"], secs=round(time.time() - t0, 3),
              rows=result.get("row_count"), error=result.get("error"),
              preview=tools.result_preview(result, 8),
-             # the UI renders the actual table, not just the text preview
              columns=result.get("columns", []), data=result.get("rows", [])[:50])
-    return {"result": result, "tried": [_norm(state["sql"])], "events": [ev]}
+    return {
+        "result": result,
+        "tried": [_norm(state["sql"])],
+        "pending": None if result["ok"] else [f"The query failed with: {result['error']}"],
+        "events": [ev],
+    }
+
+
+def diagnose_empty(state: S) -> dict:
+    """Zero rows is ambiguous: no such data, or a wrong query.
+
+    Drop one AND-ed filter at a time and see where rows reappear. Pure Python —
+    it cannot talk itself into 'an empty result is acceptable here'.
+    """
+    d = checks.diagnose(state["sql"])
+    pending = None
+    if d.get("culprits"):
+        worst = max(d["culprits"], key=lambda c: c["rows_without_it"])
+        pending = [f"The result was empty. Diagnosis: removing "
+                   f"`{worst['condition']}` yields {worst['rows_without_it']:,} "
+                   f"rows, so that filter is wrong or too narrow. Fix it — do "
+                   f"not simply drop it unless the question truly does not ask "
+                   f"for it."]
+    return {"diagnosis": d, "pending": pending,
+            "events": [_ev("diagnose_empty", summary=d.get("summary"),
+                           conditions=d.get("conditions"))]}
 
 
 VERIFY_SYS = """You check whether a SQL query truly answers a question. You are the last line of defence against a confident wrong answer.
 
 Reply with exactly one line of JSON:
-{"verdict": "ok", "reason": "..."} or {"verdict": "bad", "reason": "..."}
+{{"verdict": "ok", "reason": "..."}} or {{"verdict": "bad", "reason": "..."}}
 
 Say "bad" if: the query answers a different question, a required filter is
-missing (e.g. delivered-only), the aggregation or grouping is wrong, the result
-is empty when data should exist, or the numbers are implausible.
+missing, it contradicts a DEFINITION below, the aggregation or grouping is
+wrong, or the numbers are implausible.
 Say "ok" if the query and result genuinely answer the question. Do not demand
-extra columns or stylistic changes."""
+extra columns or stylistic changes.
+
+DEFINITIONS — the house meanings. A query that contradicts one of these is
+"bad" even if it looks reasonable:
+{glossary}"""
 
 
 def verify(state: S) -> dict:
-    user = (
-        f"Question: {state['question']}\n\n"
-        f"SQL:\n{state['sql']}\n\n"
-        f"Result:\n{tools.result_preview(state['result'])}"
-    )
-    text, usage = _call("verifier", VERIFY_SYS, user)
+    user = (f"Question: {state['question']}\n\n"
+            f"SQL:\n{state['sql']}\n\n"
+            f"Result:\n{tools.result_preview(state['result'])}")
+    text, usage = _call("verifier",
+                        VERIFY_SYS.format(glossary=GLOSSARY or "(none)"), user)
     verdict, reason = "ok", ""
     m = re.search(r"\{.*\}", text, re.S)
     if m:
@@ -162,32 +223,49 @@ def verify(state: S) -> dict:
             verdict = str(parsed.get("verdict", "ok")).lower()
             reason = str(parsed.get("reason", ""))
         except json.JSONDecodeError:
-            verdict = "bad" if re.search(r"\bbad\b", text, re.I) else "ok"
-            reason = text[:300]
+            verdict, reason = ("bad" if re.search(r"\bbad\b", text, re.I) else "ok"), text[:300]
     else:
-        verdict = "bad" if re.search(r"\bbad\b", text, re.I) else "ok"
-        reason = text[:300]
+        verdict, reason = ("bad" if re.search(r"\bbad\b", text, re.I) else "ok"), text[:300]
     verdict = "bad" if verdict not in ("ok", "bad") else verdict
     return {
         "verdict": verdict,
         "critique": reason,
+        "pending": [f"A reviewer rejected the previous query: {reason}"] if verdict == "bad" else None,
         "events": [_ev("verify", verdict=verdict, reason=reason, usage=usage)],
+    }
+
+
+def revise(state: S) -> dict:
+    """The single way back to write_sql. Whatever detected the problem left its
+    explanation in `pending`; this promotes it to `feedback` and spends one of
+    the three attempts."""
+    pending = state.get("pending") or ["The previous attempt was unsatisfactory."]
+    return {
+        "attempts": state["attempts"] + 1,
+        "feedback": list(pending),
+        "pending": None,
+        "events": [_ev("revise", detail=" ".join(pending)[:400])],
     }
 
 
 ANSWER_SYS = """You report a data result to a business user. Two or three sentences.
 State the actual numbers from the result. No SQL, no hedging, no invented facts.
-If the result is empty or the query failed, say plainly that you could not answer."""
+If the result is empty, explain WHAT the diagnosis says is missing rather than
+just saying there is no data. If the result failed verification, say so plainly."""
 
 
 def answer(state: S) -> dict:
-    caveat = ""
+    notes = []
     if state.get("verdict") == "bad":
-        caveat = ("\n\nNOTE: this result did not pass verification "
-                  f"({state.get('critique')}). Say so honestly in your answer.")
+        notes.append(f"This result did not pass verification: {state.get('critique')}")
+    d = state.get("diagnosis")
+    if d and d.get("summary") and not (state.get("result") or {}).get("row_count"):
+        notes.append(f"Why the result is empty: {d['summary']}")
     result = state.get("result") or {"ok": False, "error": "no query succeeded"}
     user = (f"Question: {state['question']}\n\n"
-            f"Result:\n{tools.result_preview(result)}{caveat}")
+            f"Result:\n{tools.result_preview(result)}")
+    if notes:
+        user += "\n\nNOTE: " + " ".join(notes)
     text, usage = _call("answerer", ANSWER_SYS, user)
     return {"answer": text, "events": [_ev("answer", text=text, usage=usage)]}
 
@@ -196,55 +274,46 @@ def answer(state: S) -> dict:
 def after_write(state: S) -> str:
     if _norm(state["sql"]) in (state.get("tried") or []):
         return "nudge" if state["attempts"] < MAX_ATTEMPTS else "answer"
+    if state.get("pending"):                       # precheck found a problem
+        return "revise" if state["attempts"] < MAX_ATTEMPTS else "execute"
     return "execute"
 
 
 def after_execute(state: S) -> str:
-    if state["result"]["ok"]:
-        return "verify"
-    if state["attempts"] >= MAX_ATTEMPTS:
-        return "answer"                      # out of retries: answer honestly
-    return "revise_error"
+    if not state["result"]["ok"]:
+        return "revise" if state["attempts"] < MAX_ATTEMPTS else "answer"
+    if state["result"]["row_count"] == 0:
+        return "diagnose_empty"
+    return "verify"
+
+
+def after_diagnose(state: S) -> str:
+    if state.get("pending") and state["attempts"] < MAX_ATTEMPTS:
+        return "revise"
+    return "answer"                                # genuinely absent: say so
 
 
 def after_verify(state: S) -> str:
     if state["verdict"] == "ok" or state["attempts"] >= MAX_ATTEMPTS:
         return "answer"
-    return "revise_critique"
-
-
-def revise_error(state: S) -> dict:
-    return {
-        "attempts": state["attempts"] + 1,
-        "feedback": [f"The query failed with: {state['result']['error']}"],
-        "events": [_ev("revise", why="sql_error", detail=state["result"]["error"])],
-    }
-
-
-def revise_critique(state: S) -> dict:
-    return {
-        "attempts": state["attempts"] + 1,
-        "feedback": [f"A reviewer rejected the previous query: {state['critique']}"],
-        "events": [_ev("revise", why="verify_failed", detail=state["critique"])],
-    }
+    return "revise"
 
 
 # ── graph ───────────────────────────────────────────────────────────────────
 def build_graph():
     g = StateGraph(S)
-    for name, fn in (("write_sql", write_sql), ("nudge", nudge), ("execute", execute),
-                     ("verify", verify), ("answer", answer),
-                     ("revise_error", revise_error),
-                     ("revise_critique", revise_critique)):
+    for name, fn in (("write_sql", write_sql), ("nudge", nudge),
+                     ("execute", execute), ("diagnose_empty", diagnose_empty),
+                     ("verify", verify), ("revise", revise), ("answer", answer)):
         g.add_node(name, fn)
 
     g.add_edge(START, "write_sql")
     g.add_conditional_edges("write_sql", after_write)
     g.add_edge("nudge", "write_sql")
     g.add_conditional_edges("execute", after_execute)
+    g.add_conditional_edges("diagnose_empty", after_diagnose)
     g.add_conditional_edges("verify", after_verify)
-    g.add_edge("revise_error", "write_sql")
-    g.add_edge("revise_critique", "write_sql")
+    g.add_edge("revise", "write_sql")
     g.add_edge("answer", END)
     return g.compile()
 
@@ -254,8 +323,9 @@ APP = build_graph()
 
 def initial_state(question: str) -> dict:
     return {"question": question, "schema": tools.schema_text(), "sql": None,
-            "result": None, "verdict": None, "critique": None, "feedback": [],
-            "tried": [], "attempts": 0, "answer": None, "events": []}
+            "result": None, "verdict": None, "critique": None, "diagnosis": None,
+            "pending": None, "feedback": [], "tried": [], "attempts": 0,
+            "answer": None, "events": []}
 
 
 def ask(question: str) -> dict:
@@ -273,10 +343,11 @@ def stream(question: str):
 if __name__ == "__main__":
     import sys
 
-    q = " ".join(sys.argv[1:]) or "Which product category has the worst average review score?"
+    q = " ".join(sys.argv[1:]) or "top 3 spending customers in the last few months"
     final = ask(q)
     for e in final["events"]:
-        print(f"[{e['node']}] " + json.dumps({k: v for k, v in e.items()
-                                              if k not in ("node", "t")})[:220])
+        print(f"[{e['node']}] " + json.dumps(
+            {k: v for k, v in e.items() if k not in ("node", "t", "data", "columns")}
+        )[:260])
     print("\nSQL:\n" + (final["sql"] or "-"))
     print("\nANSWER:\n" + (final["answer"] or "-"))

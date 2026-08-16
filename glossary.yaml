@@ -1,0 +1,73 @@
+# House definitions for business terms.
+#
+# This exists because of a measured failure. Asked for "total revenue from
+# delivered orders" the agent summed order_payments.payment_value
+# (15,422,461.77) where the analyst means order_items.price (13,221,498.11).
+# The difference is freight. Both are defensible SQL — the disagreement is
+# over what the WORD means, and no model can infer that from a schema.
+#
+# The rule was already stated in the system prompt and the agent ignored it,
+# three attempts running. A prompt line is a suggestion; a glossary is a
+# lookup that goes to BOTH the writer and the verifier, so the rule is
+# stated where the query is written and again where it is checked.
+#
+# Add a term whenever a wrong answer traces back to a definition rather than
+# to broken SQL.
+
+revenue: >-
+  SUM(order_items.price) — the item price only. NEVER order_payments.payment_value,
+  which bundles freight and instalment effects. Freight is a separate measure
+  (see "freight"). Unless stated otherwise, restrict to delivered orders.
+
+freight: >-
+  SUM(order_items.freight_value). Reported separately from revenue, never added
+  into it.
+
+a sale / sold / purchased: >-
+  An order with orders.order_status = 'delivered'. Other statuses (shipped,
+  canceled, unavailable, invoiced, processing, created, approved) are not
+  completed sales.
+
+order value: >-
+  The total a customer actually paid, including freight:
+  SUM(order_payments.payment_value). Use this only when the question is about
+  what the customer PAID, not about revenue.
+
+customer: >-
+  customers.customer_unique_id identifies a PERSON across orders.
+  customers.customer_id is one row per order and will over-count people.
+  Use customer_unique_id for "how many customers"; either works for joins to orders.
+
+delivery delay: >-
+  order_delivered_customer_date - order_estimated_delivery_date, in days.
+  Positive means late. Only meaningful for delivered orders.
+
+delivery time: >-
+  order_delivered_customer_date - order_purchase_timestamp, in days.
+  This is how long the customer waited, distinct from "delivery delay".
+
+product category: >-
+  products.product_category_name is Portuguese. Join
+  product_category_name_translation for English names, and report English
+  unless asked otherwise.
+
+review score: >-
+  order_reviews.review_score, 1 to 5. One review per order, not per item — when
+  joining through order_items, guard against counting a review once per item.
+
+# Added after three eval failures that were ALL definitional rather than
+# broken SQL: the agent's queries ran fine and answered a slightly different
+# question. Each entry below is a disagreement that cost a wrong answer.
+
+month / monthly / calendar month: >-
+  Group by orders.order_purchase_timestamp — when the order was PLACED, not
+  when it was delivered. Format as YYYY-MM.
+
+late / delayed / overdue: >-
+  order_delivered_customer_date > order_estimated_delivery_date, compared as
+  timestamps. An order an hour late is late; do not round to whole days with
+  date_diff.
+
+share / percentage / proportion / rate: >-
+  Always report as a percentage from 0 to 100, not a 0-1 fraction, rounded to
+  2 decimal places. Multiply by 100.0 to avoid integer division.

@@ -53,13 +53,20 @@ of attempts — and the last two say so honestly rather than pretending.
 | `plan` | interpret the question; list facts still needed and who supplies each | planned |
 | `resolve` | run cheap probes to pin values, ranges and spellings | planned |
 | `clarify` | pause via `interrupt()` and ask the user — only when it changes the answer | planned |
-| `write_sql` | one complete query, every filter a literal | **built** |
+| `write_sql` | one complete query, every filter a literal; runs the precheck | **built** |
 | `nudge` | block a repeated query and force a new approach | **built** |
 | `execute` | run it read-only, record the fingerprint | **built** |
-| `diagnose_empty` | localize a zero result by progressive relaxation | planned |
+| `diagnose_empty` | localize a zero result by progressive relaxation | **built** |
 | `verify` | does this SQL genuinely answer this question? | **built** |
-| `revise` | feed the error or critique back and rewrite | **built** |
-| `answer` | report the number, with assumptions stated | **built** |
+| `revise` | promote whatever `pending` holds into feedback and rewrite | **built** |
+| `answer` | report the number, with assumptions and diagnosis stated | **built** |
+
+**One way back.** Four different things can reject an attempt — a precheck, a
+SQL error, an empty-result diagnosis, a verifier critique — but they all reach
+`write_sql` through the single `revise` node. Whichever node detected the problem
+leaves its explanation in `pending`; `revise` promotes it to `feedback` and
+spends one of the three attempts. Adding a fifth kind of rejection means writing
+a detector, not another edge.
 
 Build order is at the end.
 
@@ -339,15 +346,17 @@ while a local one keeps the easy step — then measure whether it was worth it.
 
 ## Build order
 
-| # | Change | Why it's here |
+| # | Change | Status |
 |---|---|---|
-| 1 | Value profiles in `schema_text()` | ~1 hour, no new nodes, kills a whole failure class |
-| 2 | Deterministic checks before the LLM verifier | converts both known failures into caught failures |
-| 3 | `diagnose_empty` | turns dead ends into useful answers |
-| 4 | Glossary | fixes the revenue failure without nagging the user |
-| 5 | `plan` + `resolve` | the real architecture shift; measure against 1–4 |
-| 6 | `clarify` via `interrupt()` | last — needs UI work for pause/resume |
-| 7 | Gold questions 8 → 20 | makes the number trustworthy |
+| 1 | Value profiles in `schema_text()` (`profile_db.py`) | **done** |
+| 2 | Deterministic precheck before running a query (`checks.py`) | **done** |
+| 3 | `diagnose_empty` by progressive relaxation | **done** |
+| 4 | Glossary, sent to writer *and* verifier | **done** |
+| 5 | Gold questions 8 → 17 | **done** |
+| 6 | `plan` + `resolve` | next — measure against the current number |
+| 7 | `clarify` via `interrupt()` | needs UI work for pause/resume |
+| 8 | Permissions enforced in `tools.py` | for a real deployment |
+| 9 | Hybrid text + SQL over the 41% of reviews with comments | the "why" questions |
 
 Measure every step against `eval/run_eval.py`. Current baseline: **7/8 (87.5%)**
 execution accuracy, all three roles on local `gpt-oss:20b`.

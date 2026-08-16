@@ -28,6 +28,7 @@ DB_PATH = DATA / "olist.duckdb"
 # Short names cost fewer tokens and read better in generated SQL.
 CSV_TABLES = {
     "olist_customers_dataset.csv": "customers",
+    "olist_geolocation_dataset.csv": "geolocation",  # real data only (~1M rows)
     "olist_orders_dataset.csv": "orders",
     "olist_order_items_dataset.csv": "order_items",
     "olist_products_dataset.csv": "products",

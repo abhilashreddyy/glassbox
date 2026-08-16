@@ -9,6 +9,7 @@ import re
 from typing import Any
 
 import db
+import profile_db
 
 MAX_ROWS = 200          # what we return to the caller
 PROMPT_ROWS = 15        # what we show the model (context is expensive)
@@ -22,24 +23,14 @@ FORBIDDEN = re.compile(
 
 
 def schema_text() -> str:
-    """Compact schema for the prompt: every table, its columns and types.
+    """Schema *and* value profile for the prompt.
 
-    All 8 tables cost ~500 tokens, far less than the agent burning turns
-    rediscovering them — and a model that can see the whole schema at once
-    writes better joins. Exploration turns are worth spending on *values*,
-    not on structure.
+    Structure alone (`order_status VARCHAR`) is not enough to write a correct
+    filter — you also need the values ('delivered', 'shipped', …) and the
+    ranges (data ends 2018-10-17). Both are computed once at build time and
+    cost ~1,000 tokens, far less than the failures they prevent.
     """
-    con = db.connect()
-    try:
-        lines = []
-        for (table,) in con.execute("SHOW TABLES").fetchall():
-            cols = con.execute(f"DESCRIBE {table}").fetchall()
-            n = con.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            fields = ", ".join(f"{c[0]} {c[1]}" for c in cols)
-            lines.append(f"{table} ({n:,} rows): {fields}")
-        return "\n".join(lines)
-    finally:
-        con.close()
+    return profile_db.as_text()
 
 
 def distinct_values(table: str, column: str, limit: int = 20) -> list:

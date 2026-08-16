@@ -60,9 +60,16 @@
     GROUP BY payment_type ORDER BY COUNT(*) DESC LIMIT 1
 
 - id: seller_count
+  # "sold" is a glossary term meaning a DELIVERED order. The first version of
+  # this gold ignored that and counted every order_items row (3,095). The agent
+  # applied the glossary and answered 2,970 — correctly. The eval was wrong,
+  # not the agent. Kept deliberately: it tests that definitions are applied.
   question: How many distinct sellers sold at least one item?
   gold: |
-    SELECT COUNT(DISTINCT seller_id) AS sellers FROM order_items
+    SELECT COUNT(DISTINCT oi.seller_id) AS sellers
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.order_id
+    WHERE o.order_status = 'delivered'
 
 - id: freight_delivered
   question: What is the total freight value paid on delivered orders?
@@ -71,3 +78,92 @@
     FROM order_items oi
     JOIN orders o ON oi.order_id = o.order_id
     WHERE o.order_status = 'delivered'
+
+# ── harder set: joins, date maths, conditional aggregation, subqueries ──────
+# The first eight are mostly single-table or one join. These exercise the parts
+# where text-to-SQL actually falls over.
+
+- id: avg_delivery_days
+  question: On average, how many days pass between purchase and delivery for delivered orders?
+  gold: |
+    SELECT ROUND(AVG(date_diff('day', order_purchase_timestamp,
+                               order_delivered_customer_date)), 2) AS avg_days
+    FROM orders
+    WHERE order_status = 'delivered' AND order_delivered_customer_date IS NOT NULL
+
+- id: pct_late
+  question: What percentage of delivered orders arrived after the estimated delivery date?
+  gold: |
+    SELECT ROUND(100.0 * SUM(CASE WHEN order_delivered_customer_date
+                                       > order_estimated_delivery_date
+                                  THEN 1 ELSE 0 END) / COUNT(*), 2) AS pct_late
+    FROM orders
+    WHERE order_status = 'delivered' AND order_delivered_customer_date IS NOT NULL
+
+- id: top_category_revenue
+  question: Which product category generates the most revenue?
+  ordered: true
+  gold: |
+    SELECT t.product_category_name_english AS category
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.order_id
+    JOIN products p ON oi.product_id = p.product_id
+    JOIN product_category_name_translation t
+      ON p.product_category_name = t.product_category_name
+    WHERE o.order_status = 'delivered'
+    GROUP BY 1 ORDER BY SUM(oi.price) DESC LIMIT 1
+
+- id: best_month
+  question: Which calendar month had the highest revenue?
+  ordered: true
+  gold: |
+    SELECT strftime(o.order_purchase_timestamp, '%Y-%m') AS month
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.order_id
+    WHERE o.order_status = 'delivered'
+    GROUP BY 1 ORDER BY SUM(oi.price) DESC LIMIT 1
+
+- id: late_review_score
+  question: What is the average review score for orders that were delivered later than estimated?
+  gold: |
+    SELECT ROUND(AVG(r.review_score), 2) AS avg_score
+    FROM order_reviews r
+    JOIN orders o ON r.order_id = o.order_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_delivered_customer_date > o.order_estimated_delivery_date
+
+- id: repeat_customers
+  question: How many customers have placed more than one order, counting orders of any status?
+  gold: |
+    SELECT COUNT(*) AS repeat_customers FROM (
+      SELECT c.customer_unique_id
+      FROM orders o JOIN customers c ON o.customer_id = c.customer_id
+      GROUP BY 1 HAVING COUNT(*) > 1
+    )
+
+- id: top_seller_state
+  question: Which seller state has the highest total revenue?
+  ordered: true
+  gold: |
+    SELECT s.seller_state AS state
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.order_id
+    JOIN sellers s ON oi.seller_id = s.seller_id
+    WHERE o.order_status = 'delivered'
+    GROUP BY 1 ORDER BY SUM(oi.price) DESC LIMIT 1
+
+- id: avg_items_per_order
+  question: What is the average number of items in a delivered order?
+  gold: |
+    SELECT ROUND(AVG(n), 2) AS avg_items FROM (
+      SELECT o.order_id, COUNT(*) AS n
+      FROM order_items oi JOIN orders o ON oi.order_id = o.order_id
+      WHERE o.order_status = 'delivered'
+      GROUP BY 1
+    )
+
+- id: pct_reviews_with_text
+  question: What share of reviews include a written comment message?
+  gold: |
+    SELECT ROUND(100.0 * COUNT(review_comment_message) / COUNT(*), 2) AS pct
+    FROM order_reviews
