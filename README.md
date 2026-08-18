@@ -1,14 +1,14 @@
 # glassbox
 
-**A data analyst agent that shows its work.**
+**A data-analyst agent that verifies its own answers — and shows you the evidence.**
 
-Ask a business question in English. The agent writes SQL, runs it, *checks its
-own answer*, diagnoses empty results instead of shrugging at them, revises when
-a check fails, and reports back — with every step, every token and every
-revision visible in the UI.
+Ask a business question in English. The agent grounds itself in the real data,
+writes SQL, runs it, **checks whether the result actually answers the question**,
+diagnoses empty results instead of shrugging at them, revises when a check fails,
+and reports back with every step, token, and revision visible.
 
-Most text-to-SQL demos show you an answer. This one shows you why it believes
-the answer, and admits when it doesn't.
+Most text-to-SQL demos show you an answer. This one shows you *why it believes*
+the answer — and tells you when it doesn't.
 
 ```
 START → write_sql → (repeat? → nudge ↩) → execute ─rows→ verify ─ok→ answer → END
@@ -17,211 +17,244 @@ START → write_sql → (repeat? → nudge ↩) → execute ─rows→ verify �
             └─────────── revise ───────────┴───────────┴────────┘  (attempts ≤ 3)
 ```
 
-See [DESIGN.md](DESIGN.md) for how it works.
+Built on LangGraph over the real 100k-order [Olist e-commerce
+dataset](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) in DuckDB.
+Runs entirely on a local 20B model, or on any API model, per node.
 
-## Run it
+---
+
+## Why this exists
+
+An LLM that writes SQL is easy. The problem is that **nothing checks the
+answer.** A model can produce SQL that parses, runs, returns a clean number, and
+answers a subtly different question than the one asked. The user sees a
+confident number and has no reason to doubt it.
+
+Every wrong answer this project produced was of exactly that kind — the SQL was
+never broken. So the engineering went into the checks, not the prompt.
+
+## Results
+
+Execution accuracy on 17 hand-written gold questions, all three roles on local
+`gpt-oss:20b`:
+
+| Configuration | Accuracy |
+|---|---|
+| Schema only (8 questions) | 7/8 — 87.5% |
+| Schema only (17 questions) | 14/17 — 82.4% |
+| **+ value profiles, glossary, deterministic checks** | **17/17 — 100%** |
+
+### Read that 100% with suspicion
+
+Three of the seventeen were failing until three glossary entries were added,
+written *after seeing exactly which questions failed and why*. That is fitting to
+the test set, and a number produced that way does not measure how the agent
+handles a question it has never seen.
+
+What it honestly shows: **every failure was definitional, and a definition fixed
+it.** The clean measurement is a held-out set — written without looking at any
+failure, run once. Until then, 100% means "the known failure modes are closed",
+not "accuracy".
+
+That distinction is the point of the project.
+
+## What the failures taught
+
+Every failure was **definitional, not syntactic** — the query ran and answered a
+slightly different question:
+
+| Question | What went wrong |
+|---|---|
+| *total revenue from delivered orders* | summed `payment_value` (15,422,461.77) where an analyst means `order_items.price` (13,221,498.11) — the gap is freight |
+| *revenue from customers in Lisbon* | `SUM()` over zero rows returns one row containing `NULL`; the agent reported "no revenue records exist" and **the verifier approved it** |
+| *highest-revenue calendar month* | grouped by delivery date instead of purchase date |
+| *average review score for late deliveries* | used `date_diff(day) > 0`, so an order two hours late counted as on time |
+| *share of reviews with a comment* | returned `0.41` where the analyst wanted `41.3` |
+| *distinct sellers who sold ≥1 item* | agent applied the glossary; **the gold SQL was wrong.** Kept as a regression test |
+
+Two conclusions drove the architecture:
+
+1. **Business-term ambiguity is the enemy, not SQL syntax.** The fix is a
+   glossary lookup sent to the writer *and* the checker — not a bigger model.
+2. **A verifier that can't see the rules can't enforce them.** Asked about an
+   empty result, the LLM verifier replied: *"An empty result set may simply
+   indicate no qualifying data, which is acceptable given the question."* Its
+   prompt told it to reject empty results. It reasoned around the rule — which is
+   what prompts permit and code does not.
+
+## Architecture
+
+**The model decides what to try; code decides what happens next.** Every routing
+decision is a deterministic function reading state. No LLM output routes
+anything.
+
+### Grounding — three tiers, cheapest first
+
+Correct SQL is impossible against values you have never seen.
+
+1. **Schema** — tables, columns, types.
+2. **Value profile** ([`profile_db.py`](profile_db.py)) — computed once at build
+   time, no LLM: every low-cardinality column's actual values with counts,
+   min/max for dates and numbers, null rates. ~1,000 tokens.
+   ```
+   order_status VARCHAR = delivered(96,478), shipped(1,107), canceled(625), …
+   order_purchase_timestamp TIMESTAMP range 2016-09-04 … 2018-10-17
+   ```
+3. **Glossary** ([`glossary.yaml`](glossary.yaml)) — house definitions, sent to
+   the writer *and* the verifier.
+
+### Verification — three layers, least fallible first
+
+1. **The database.** SQL that doesn't parse is rejected in milliseconds, and
+   DuckDB's error names the offending token. Fed back verbatim, because it is the
+   teaching signal.
+2. **Deterministic checks** ([`checks.py`](checks.py)) — no model involved:
+   - **precheck**, before execution: a query anchored to `current_date` against
+     data that ended in 2018 cannot match anything. Caught without running it.
+   - **diagnose**, after an empty result: drop one `AND`-ed filter at a time via
+     `sqlglot` and see where rows reappear, localizing the emptiness.
+     ```
+     without o.order_status = 'delivered'                    → 0
+     without o.order_purchase_timestamp >= CURRENT_DATE - 3M  → 110,197   ← culprit
+     ```
+     The user then hears *"Springfield has 1,204 delivered orders, but none after
+     2018-10-17"* instead of *"no data"*.
+3. **The LLM verifier** — last, for the judgment call only, with the glossary so
+   it has a rulebook rather than an opinion.
+
+A zero-row result is ambiguous: it means *no such data* or *my query is wrong*,
+and those are indistinguishable without a second check. Treating it as either one
+without evidence is how confident wrong answers get made.
+
+## Inference workload profile
+
+Every model call records prompt tokens, completion tokens, and latency. Measured
+over local runs on `gpt-oss:20b` (24 GB Apple Silicon, unified memory):
+
+| Role | Job | Median in | Median out | Median latency | tok/s |
+|---|---|---|---|---|---|
+| `sql_writer` | schema reasoning + correct SQL | 2,080 | 622 | 17.6s | 35.4 |
+| `verifier` | does this SQL answer this question? | 854 | 284 | 5.9s | 48.1 |
+| `answerer` | result table → sentence | 213 | 177 | 5.3s | 33.6 |
+
+The profile is deliberately lopsided: one hard call carries a 2k-token grounded
+prompt and long reasoning output, while two cheap calls handle judgment and
+prose. That asymmetry is why **each role resolves its own model**:
 
 ```bash
-.venv/bin/python server.py        # → http://127.0.0.1:8000
+export DATA_AGENT_MODEL_DEFAULT=ollama:gpt-oss:20b            # all local
+export DATA_AGENT_MODEL_SQL_WRITER=anthropic:claude-sonnet-5  # upgrade one role
 ```
+
+Which makes *"how much model does each part actually need?"* a measurement rather
+than an opinion: change one role, rerun the eval, compare accuracy against tokens
+and latency.
+
+Memory is measured too. `num_ctx=16384` holds 15 GB resident against 14 GB at
+8192, while the largest real prompt is ~2,100 tokens — on a 24 GB machine that
+unused gigabyte decides whether a run swaps.
+
+## Evaluation
+
+**Execution accuracy**: a human-written gold SQL is run, the agent's SQL is run,
+and the *results* are compared — never the SQL text, since many correct queries
+answer one question.
+
+Matching rules: numeric tolerance, column names ignored, row order ignored unless
+the question is a ranking, and gold values must appear in the agent's rows (extra
+columns are fine, but row counts must match, so nothing passes by dumping the
+whole table).
+
+Two numbers, and the gap between them is the interesting one:
+
+- **accuracy** — share of runs matching gold
+- **pass^k** — share of questions correct on *every* run, which is what
+  stochastic agents actually deliver
 
 ```bash
-.venv/bin/python eval/run_eval.py        # score against the gold set
-.venv/bin/python eval/run_eval.py -k 3   # 3 runs each — measures reliability
+.venv/bin/python eval/run_eval.py         # single pass
+.venv/bin/python eval/run_eval.py -k 3    # reliability
 ```
 
-## The data
+## Observability
 
-The real **Brazilian E-Commerce (Olist)** dataset from Kaggle — 9 tables:
+Every run writes a full trace: each node, and each model call's system prompt,
+user prompt, and raw reply verbatim.
 
-| Table | Rows | |
-|---|---|---|
-| orders | 99,441 | 5-stage delivery funnel timestamps |
-| order_items | 112,650 | price and freight per item |
-| order_reviews | 99,224 | 1–5 score, **41% carry Portuguese free text** |
-| order_payments | 103,886 | type, instalments, value |
-| customers | 99,441 | zip prefix, city, state |
-| products | 32,951 | category, weight, dimensions |
-| sellers | 3,095 | zip prefix, city, state |
-| geolocation | 1,000,163 | lat/lng per zip prefix |
-| category translation | 71 | Portuguese → English |
+```bash
+.venv/bin/python trace.py       # last run: nodes, then every prompt and reply
+.venv/bin/python trace.py -v    # untruncated
+.venv/bin/python trace.py -l    # list runs
+```
 
-Data spans 2016-09-04 to 2018-10-17. Real joins are the point — a single flat
-table gives the agent nothing to decide, and an agent that isn't deciding is
-just a prompt.
+The web UI renders the same thing live, including a graph view generated from the
+**compiled LangGraph** — so the diagram cannot drift from the code — that lights
+up nodes and numbers edges as they fire.
 
-**To rebuild from scratch:** put a Kaggle token at `~/.kaggle/kaggle.json` (or
-export `KAGGLE_API_TOKEN`), then:
+> Getting that diagram required declaring `path_map`s on every conditional edge.
+> Without them LangGraph can only see 2 of 16 edges, because a router is an
+> arbitrary function; this is why many LangGraph diagrams render uselessly sparse.
+
+## Running it
+
+```bash
+uv venv --python 3.12
+uv pip install duckdb fastapi uvicorn langgraph langchain-core langchain-ollama \
+               pyyaml sqlglot kaggle
+.venv/bin/python server.py          # → http://127.0.0.1:8000
+```
+
+Local models via [Ollama](https://ollama.com) (`ollama pull gpt-oss:20b`), or set
+`DATA_AGENT_MODEL_*` to any OpenAI/Anthropic model.
+
+**Data.** With a Kaggle token at `~/.kaggle/kaggle.json`:
 
 ```bash
 .venv/bin/kaggle datasets download -d olistbr/brazilian-ecommerce -p data/olist --unzip
 .venv/bin/python db.py && .venv/bin/python profile_db.py
 ```
 
-`db.py` falls back to generating a synthetic dataset with identical table and
-column names if no CSVs are present, so the project runs without credentials.
-
-## What the agent is given
-
-Three layers of grounding, cheapest first — because correct SQL is impossible
-against values you have never seen.
-
-1. **Schema** — tables, columns, types.
-2. **Value profile** (`profile_db.py`) — computed once at build time, no LLM:
-   every low-cardinality column's actual values with counts, min/max for dates
-   and numbers, null rates. ~1,000 tokens.
-   ```
-   order_status VARCHAR = delivered(96,478), shipped(1,107), canceled(625), …
-   order_purchase_timestamp TIMESTAMP range 2016-09-04 … 2018-10-17
-   ```
-3. **Glossary** (`glossary.yaml`) — house definitions of business terms, sent to
-   the writer *and* the verifier. Revenue means `order_items.price`, "sold"
-   means delivered, "share" means 0–100 not 0–1.
-
-## Verification
-
-Three layers, cheapest and least fallible first:
-
-1. **The database** — SQL that doesn't parse is rejected in milliseconds, and
-   DuckDB's error names the offending token. It's fed back verbatim.
-2. **Deterministic checks** (`checks.py`) — no model involved:
-   - **precheck**, before running: a query anchored to `current_date` against
-     data that ended years ago cannot match anything. Caught pre-execution.
-   - **diagnose**, after 0 rows: drop one AND-ed filter at a time and see where
-     rows reappear, which localizes the emptiness to a specific condition.
-3. **The LLM verifier** — last, for the part needing judgment, and given the
-   glossary so it has a rulebook rather than an opinion.
-
-## Models are configurable per role
-
-| Role | Job | Difficulty |
-|---|---|---|
-| `sql_writer` | schema reasoning + correct SQL | hard |
-| `verifier` | does this SQL answer this question? | medium |
-| `answerer` | turn a result table into a sentence | easy |
-
-```bash
-export DATA_AGENT_MODEL_DEFAULT=ollama:gpt-oss:20b            # everything local
-export DATA_AGENT_MODEL_SQL_WRITER=anthropic:claude-sonnet-5  # upgrade one role
-```
-
-Format is `provider:model` (`ollama`, `openai`, `anthropic`); API providers need
-their package (`uv pip install langchain-anthropic`) and the usual key. The UI
-shows which model produced every run, so *"how much model does each part
-actually need?"* is measurable: change one role, rerun the eval, compare.
-
-## How it's scored
-
-**Execution accuracy.** A human-written gold SQL is run, the agent's SQL is run,
-and the *results* are compared — never the SQL text, since many correct queries
-answer one question.
-
-Matching rules: numeric tolerance, column names ignored, row order ignored
-unless the question is a ranking, and gold values must appear in the agent's rows
-(extra columns are fine, but the row count must match so nothing passes by
-dumping the whole table).
-
-Two numbers, and the gap between them is the interesting one:
-- **accuracy** — share of runs that matched gold
-- **pass^k** — share of questions correct on *every* run
-
-## Results
-
-All three roles on local `gpt-oss:20b`, real Olist data, on a 24 GB Mac.
-
-| Stage | Accuracy |
-|---|---|
-| 8 questions, schema only | 7/8 = 87.5% |
-| 17 questions, schema only | 14/17 = 82.4% |
-| 17 questions, + profiles + glossary + checks | **17/17 = 100%** |
-
-### Read that 100% with suspicion
-
-Three of those seventeen were failing until I added three glossary entries —
-written *after seeing exactly which questions failed and why*. That is fitting
-to the test set, and a number produced that way is not a measure of how the
-agent handles a question it has never met.
-
-What it does honestly show: **every failure was definitional, and a definition
-fixed it.** The mechanism works. What it does not show is the hit rate on
-unseen questions.
-
-The clean measurement is a held-out set: write new questions without looking at
-any failure, run once, report that. Until then, treat 100% as "the known
-failure modes are closed", not as accuracy.
-
-### What the failures taught us
-
-Every failure this project has produced has been **definitional, not syntactic**.
-The SQL runs; it answers a slightly different question.
-
-- *"total revenue from delivered orders"* — the agent summed
-  `order_payments.payment_value` (15,422,461.77) where an analyst means
-  `order_items.price` (13,221,498.11). The difference is freight. Stating the
-  rule in the system prompt was not enough; it took a glossary entry sent to
-  both the writer and the verifier.
-- *"how many distinct sellers sold at least one item"* — the agent applied the
-  glossary's definition of "sold" (delivered only, 2,970) while the gold SQL
-  ignored it (3,095). **The eval was wrong, not the agent.** Kept as a test that
-  definitions are actually applied.
-- *"which calendar month had the highest revenue"* — grouped by delivery date
-  instead of purchase date.
-- *"average review score for late deliveries"* — used `date_diff(day) > 0`,
-  making an order two hours late count as on time.
-- *"what share of reviews include a comment"* — returned 0.41 where the gold
-  wanted 41.3.
-
-The last three were fixed by adding three glossary entries. That is the whole
-thesis of the project in one experiment: **business-term ambiguity is the enemy,
-and the fix is a lookup both the writer and the checker can see** — not a
-smarter model, and not a longer prompt.
-
-Also observed: a run where the model aliased `order_reviews AS or` — a reserved
-word — DuckDB rejected it, the error fed back, and attempt 2 fixed the alias.
-Error-driven revision works.
-
-## Seeing what the agent did
-
-The web UI streams each step live. To see what the models were actually *sent*
-— the part that explains why a query came out the way it did — replay the trace:
-
-```bash
-.venv/bin/python trace.py        # last run: nodes, then every prompt and reply
-.venv/bin/python trace.py -v     # full prompts, untruncated
-.venv/bin/python trace.py -l     # list saved runs
-```
-
-Traces are written to `traces/` on every run, from the UI and the CLI alike.
-Local files, no service and no account — LangSmith or Langfuse would add hosted
-history and cross-run comparison, but nothing you need to answer "why did it do
-that?" on a single run.
+Without credentials, `db.py` generates a synthetic dataset with identical table
+and column names, so everything runs unchanged.
 
 ## Layout
 
 ```
 graph.py          the agent — nodes, routers, guarded cycles
-tools.py          read-only SQL + schema text
-profile_db.py     value profiles: what the schema doesn't say
-checks.py         deterministic verification (precheck, diagnose)
+checks.py         deterministic verification (precheck, empty-result diagnosis)
+profile_db.py     value profiles computed at build time
 glossary.yaml     house definitions of business terms
-db.py             builds DuckDB from Olist CSVs (or synthetic)
-config.py         model routing per role
-server.py         FastAPI + SSE: streams each node to the browser
-static/index.html the glass-box UI
+tools.py          read-only SQL, schema text, 25s query cap
+config.py         per-role model routing
+server.py         FastAPI + SSE, streams every node to the browser
+static/index.html live graph view and glass-box UI
 eval/             gold questions + execution-accuracy harness
+trace.py          replay any run, prompts included
 ```
 
-Safety by construction: the connection is **read-only**, DDL/DML is rejected, and
-results are row-capped. The database has to stay trustworthy — it's the oracle
-everything is graded against.
+Safety by construction: read-only connection, DDL/DML rejected, results
+row-capped, and a query timeout via `con.interrupt()` — one accidental join
+against the 1M-row geolocation table would otherwise block a run indefinitely.
 
-## Next
+See **[DESIGN.md](DESIGN.md)** for the full architecture, including the planned
+`plan` / `resolve` / `clarify` nodes and why they aren't built yet.
 
-1. `plan` + `resolve` nodes — probe the data to pin ambiguous values before
-   writing SQL, instead of guessing and revising.
-2. `clarify` via `interrupt()` — ask the user only when the answer would
-   materially change, stating the facts while asking.
-3. Row/column permissions enforced in `tools.py`, with the schema filtered
-   before the model sees it.
-4. Hybrid text + SQL: 41% of reviews carry Portuguese comments, which is the
-   only way to answer *why* a category is rated badly.
+## What's next
+
+Ordered by expected value, not by novelty:
+
+1. **A held-out question set** — the honest accuracy number, and the reason not to
+   trust the current one.
+2. **Ground the verifier further** — give it row counts and date ranges, and let
+   it run its own probe queries. It is currently an opinion; this makes it an
+   investigation.
+3. **`plan` / `resolve` nodes** — resolve high-cardinality values (thousands of
+   cities) and ambiguous terms *before* generating SQL, with `interrupt()` to ask
+   the user only when the answer would materially change.
+
+The evidence so far says definitions beat machinery, which is exactly why #1
+comes before #3.
+
+---
+
+MIT licensed. Dataset: [Olist Brazilian E-Commerce](https://www.kaggle.com/datasets/olistbr/brazilian-ecommerce) (CC BY-NC-SA 4.0).
