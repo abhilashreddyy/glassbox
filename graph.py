@@ -120,6 +120,22 @@ def _norm(sql: str) -> str:
     return re.sub(r"\s+", " ", (sql or "").strip().lower()).rstrip(";")
 
 
+def _is_empty(result: dict) -> bool:
+    """Did this query actually find anything?
+
+    `row_count == 0` is not enough. A bare aggregate over zero matching rows
+    returns ONE row containing NULL — `SELECT SUM(price) ... WHERE city =
+    'Lisbon'` yields `[[None]]`, which looks like a result and is not one.
+    Observed in the wild: the agent reported "no revenue records exist" and the
+    verifier approved it, with no diagnosis of why. That shrug is the exact
+    failure this project exists to catch.
+    """
+    if result.get("row_count", 0) == 0:
+        return True
+    rows = result.get("rows") or []
+    return len(rows) == 1 and all(v is None for v in rows[0])
+
+
 def _ev(node: str, **kw) -> dict:
     return {"node": node, "t": round(time.time(), 3), **kw}
 
@@ -304,7 +320,7 @@ def answer(state: S) -> dict:
     if state.get("verdict") == "bad":
         notes.append(f"This result did not pass verification: {state.get('critique')}")
     d = state.get("diagnosis")
-    if d and d.get("summary") and not (state.get("result") or {}).get("row_count"):
+    if d and d.get("summary") and _is_empty(state.get("result") or {}):
         notes.append(f"Why the result is empty: {d['summary']}")
     result = state.get("result") or {"ok": False, "error": "no query succeeded"}
     user = (f"Question: {state['question']}\n\n"
@@ -316,6 +332,7 @@ def answer(state: S) -> dict:
 
 
 # ── routers: control flow lives in code, not in the model's output ──────────
+
 def after_write(state: S) -> str:
     if _norm(state["sql"]) in (state.get("tried") or []):
         return "nudge" if state["attempts"] < MAX_ATTEMPTS else "answer"
@@ -327,7 +344,7 @@ def after_write(state: S) -> str:
 def after_execute(state: S) -> str:
     if not state["result"]["ok"]:
         return "revise" if state["attempts"] < MAX_ATTEMPTS else "answer"
-    if state["result"]["row_count"] == 0:
+    if _is_empty(state["result"]):
         return "diagnose_empty"
     return "verify"
 
