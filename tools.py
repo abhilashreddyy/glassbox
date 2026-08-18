@@ -6,6 +6,7 @@ oracle — which is the whole basis for scoring this agent.
 """
 
 import re
+import threading
 from typing import Any
 
 import db
@@ -13,6 +14,7 @@ import profile_db
 
 MAX_ROWS = 200          # what we return to the caller
 PROMPT_ROWS = 15        # what we show the model (context is expensive)
+TIMEOUT_S = 25          # a generated query must never hang the whole run
 
 # Anything that could change data or reach outside the query engine.
 FORBIDDEN = re.compile(
@@ -58,21 +60,37 @@ def run_sql(query: str) -> dict[str, Any]:
         return {"ok": False, "error": "Only read-only SELECT queries are allowed."}
 
     con = db.connect()
+    out: dict[str, Any] = {}
+
+    def work():
+        try:
+            cur = con.execute(query)
+            columns = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchmany(MAX_ROWS)
+            out.update({"ok": True, "columns": columns,
+                        "rows": [list(r) for r in rows], "row_count": len(rows),
+                        "truncated": len(rows) == MAX_ROWS})
+        except Exception as e:
+            out.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    # A generated query can be accidentally quadratic — one bad join against
+    # the 1M-row geolocation table would otherwise block the run forever.
+    # DuckDB can be interrupted from another thread, so run it in one.
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(TIMEOUT_S)
+    if t.is_alive():
+        con.interrupt()
+        t.join(5)
+        out = {"ok": False,
+               "error": (f"Query cancelled after {TIMEOUT_S}s. It is too "
+                         f"expensive — simplify it: avoid joining geolocation "
+                         f"unless needed, and make sure every join has a key.")}
     try:
-        cur = con.execute(query)
-        columns = [d[0] for d in cur.description] if cur.description else []
-        rows = cur.fetchmany(MAX_ROWS)
-        return {
-            "ok": True,
-            "columns": columns,
-            "rows": [list(r) for r in rows],
-            "row_count": len(rows),
-            "truncated": len(rows) == MAX_ROWS,
-        }
-    except Exception as e:
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
-    finally:
         con.close()
+    except Exception:
+        pass
+    return out
 
 
 def result_preview(result: dict, max_rows: int = PROMPT_ROWS) -> str:

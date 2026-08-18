@@ -62,6 +62,37 @@
   .badge.bad{background:rgba(220,38,38,.14);color:var(--bad)}
   details summary{cursor:pointer;color:var(--muted);font-size:12.5px}
   .empty{color:var(--muted);font-size:13.5px}
+  .working{display:flex;gap:9px;align-items:center;padding:9px 0;color:var(--muted);
+    font-size:12.5px}
+  .working .dot{width:9px;height:9px;border-radius:50%;background:var(--accent);
+    animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+  @media (prefers-reduced-motion:reduce){.working .dot{animation:none;opacity:.7}}
+  .gnode.running rect{stroke:var(--accent);stroke-dasharray:4 3;
+    animation:dashmove 1s linear infinite}
+  @keyframes dashmove{to{stroke-dashoffset:-14}}
+  @media (prefers-reduced-motion:reduce){.gnode.running rect{animation:none}}
+  /* graph view */
+  #graphwrap{overflow-x:auto}
+  #graphview{width:100%;min-width:660px;height:auto;display:block}
+  .gnode rect{fill:var(--panel);stroke:var(--line);stroke-width:1.5;
+    transition:fill .25s,stroke .25s}
+  .gnode text{fill:var(--muted);font:600 11px ui-monospace,Menlo,monospace;
+    transition:fill .25s}
+  .gnode.visited rect{stroke:var(--accent);fill:color-mix(in srgb,var(--accent) 12%,var(--panel))}
+  .gnode.visited text{fill:var(--ink)}
+  .gnode.active rect{stroke:var(--accent);stroke-width:2.5;
+    fill:color-mix(in srgb,var(--accent) 26%,var(--panel))}
+  .gnode.terminal rect{rx:14}
+  .gedge{fill:none;stroke:var(--line);stroke-width:1.4;
+    transition:stroke .25s,stroke-width .25s}
+  .gedge.cond{stroke-dasharray:4 3}
+  .gedge.fired{stroke:var(--accent);stroke-width:2.4;stroke-dasharray:none}
+  .gcount{fill:var(--accent);font:700 10px ui-monospace,Menlo,monospace}
+  .glegend{fill:var(--muted);font:400 10px ui-sans-serif,sans-serif}
+  @media (prefers-reduced-motion:reduce){
+    .gnode rect,.gnode text,.gedge{transition:none}
+  }
 </style>
 </head>
 <body>
@@ -80,6 +111,11 @@
 
   <div class="cols">
     <div>
+      <div class="card">
+        <h2>Graph</h2>
+        <div id="graphwrap"><svg id="graphview" viewBox="0 0 800 250"
+             role="img" aria-label="agent graph, highlighted as it runs"></svg></div>
+      </div>
       <div class="card">
         <h2>Process</h2>
         <div id="steps"><div class="empty">Ask something to watch the agent work.</div></div>
@@ -111,6 +147,129 @@
 const $ = id => document.getElementById(id);
 let source = null;
 
+// ── graph view ────────────────────────────────────────────────────────────
+// Nodes and edges come from /api/graph, which reads the COMPILED LangGraph.
+// The picture is generated from the real graph, so it cannot drift from the
+// code. Only the coordinates are ours.
+const POS = {
+  __start__:      [ 42, 118, 'START'],
+  write_sql:      [175, 118, 'write_sql'],
+  execute:        [340, 118, 'execute'],
+  verify:         [505, 118, 'verify'],
+  answer:         [645, 118, 'answer'],
+  __end__:        [757, 118, 'END'],
+  nudge:          [175, 214, 'nudge'],
+  diagnose_empty: [420, 214, 'diagnose_empty'],
+  revise:         [340,  30, 'revise'],
+};
+const NW = 96, NH = 26;                       // node box, and the two terminals
+const TW = {__start__: 56, __end__: 50};
+const SVG_NS = 'http://www.w3.org/2000/svg';
+let EDGES = [];
+
+function nodeBox(id){
+  const [cx, cy] = POS[id];
+  const w = TW[id] || NW;
+  return {cx, cy, w, h: NH, x: cx - w/2, y: cy - NH/2};
+}
+
+// Stop the line at the box border rather than its centre, so arrowheads land
+// on the edge of the node instead of underneath it.
+function clip(box, tx, ty){
+  const dx = tx - box.cx, dy = ty - box.cy;
+  if(!dx && !dy) return [box.cx, box.cy];
+  const sx = dx ? (box.w/2 + 4) / Math.abs(dx) : Infinity;
+  const sy = dy ? (box.h/2 + 4) / Math.abs(dy) : Infinity;
+  const s = Math.min(sx, sy);
+  return [box.cx + dx*s, box.cy + dy*s];
+}
+
+function edgePath(a, b){
+  const A = nodeBox(a), B = nodeBox(b);
+  const [x1, y1] = clip(A, B.cx, B.cy);
+  const [x2, y2] = clip(B, A.cx, A.cy);
+  // Backward edges bow outward so they don't hide under the forward flow.
+  const back = B.cx < A.cx;
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+  const bow = back ? -34 : 0;
+  return `M ${x1} ${y1} Q ${mx} ${my + bow} ${x2} ${y2}`;
+}
+
+function drawGraph(struct){
+  const svg = $('graphview');
+  svg.innerHTML = '';
+  EDGES = struct.edges.filter(e => POS[e.source] && POS[e.target]);
+
+  const defs = document.createElementNS(SVG_NS, 'defs');
+  defs.innerHTML =
+    `<marker id="ah" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6"
+       markerHeight="6" orient="auto-start-reverse">
+       <path d="M0 0 L8 4 L0 8 z" fill="currentColor"/></marker>`;
+  svg.appendChild(defs);
+
+  for(const e of EDGES){
+    const path = document.createElementNS(SVG_NS, 'path');
+    path.setAttribute('d', edgePath(e.source, e.target));
+    path.setAttribute('class', 'gedge' + (e.conditional ? ' cond' : ''));
+    path.setAttribute('marker-end', 'url(#ah)');
+    path.id = `e_${e.source}__${e.target}`;
+    svg.appendChild(path);
+  }
+  for(const id of Object.keys(POS)){
+    if(!struct.nodes.includes(id)) continue;
+    const b = nodeBox(id), g = document.createElementNS(SVG_NS, 'g');
+    g.setAttribute('class', 'gnode' + (TW[id] ? ' terminal' : ''));
+    g.id = `n_${id}`;
+    const r = document.createElementNS(SVG_NS, 'rect');
+    r.setAttribute('x', b.x); r.setAttribute('y', b.y);
+    r.setAttribute('width', b.w); r.setAttribute('height', b.h);
+    r.setAttribute('rx', 6);
+    const t = document.createElementNS(SVG_NS, 'text');
+    t.setAttribute('x', b.cx); t.setAttribute('y', b.cy + 4);
+    t.setAttribute('text-anchor', 'middle');
+    t.textContent = POS[id][2];
+    g.append(r, t); svg.appendChild(g);
+  }
+  const leg = document.createElementNS(SVG_NS, 'text');
+  leg.setAttribute('class', 'glegend');
+  leg.setAttribute('x', 8); leg.setAttribute('y', 244);
+  leg.textContent = 'solid = always · dashed = router decides · highlighted = taken this run';
+  svg.appendChild(leg);
+}
+
+let gPrev = null, gStep = 0;
+function graphReset(){
+  gPrev = '__start__'; gStep = 0;
+  document.querySelectorAll('.gnode').forEach(n =>
+    n.classList.remove('visited', 'active'));
+  document.querySelectorAll('.gedge').forEach(e => e.classList.remove('fired'));
+  document.querySelectorAll('.gcount').forEach(e => e.remove());
+  const s = $('n___start__'); if(s) s.classList.add('visited');
+}
+
+function graphVisit(node){
+  const el = $('n_' + node); if(!el) return;
+  document.querySelectorAll('.gnode.active').forEach(n => n.classList.remove('active'));
+  el.classList.add('visited', 'active');
+  const edge = $(`e_${gPrev}__${node}`);
+  if(edge){
+    edge.classList.add('fired');
+    gStep += 1;
+    // number each traversal, so a cycle reads as an order rather than a blur
+    const d = edge.getAttribute('d').split(' ');
+    const lbl = document.createElementNS(SVG_NS, 'text');
+    lbl.setAttribute('class', 'gcount');
+    lbl.setAttribute('x', Number(d[4]) + 3);
+    lbl.setAttribute('y', Number(d[5]) - 4);
+    lbl.textContent = gStep;
+    $('graphview').appendChild(lbl);
+  }
+  gPrev = node;
+}
+
+fetch('/api/graph').then(r => r.json()).then(st => { drawGraph(st); graphReset(); });
+
+
 fetch('/api/meta').then(r => r.json()).then(m => {
   $('models').innerHTML =
     Object.entries(m.models).map(([k,v]) => `${k}: <b>${v}</b>`).join('')
@@ -124,6 +283,28 @@ fetch('/api/meta').then(r => r.json()).then(m => {
 
 function esc(s){ return String(s ?? '').replace(/[&<>]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+
+// A node only emits its event when it FINISHES, and a local model can take a
+// minute — so between events the page would otherwise look frozen. The server
+// sends a tick every 2s; this shows what we are waiting on and for how long.
+function showWorking(after, secs){
+  let w = $('working');
+  if(!w){
+    w = document.createElement('div');
+    w.id = 'working'; w.className = 'working';
+    $('steps').appendChild(w);
+  }
+  const next = {starting: 'writing the first query',
+                write_sql: 'running the query',
+                execute: 'checking the result',
+                diagnose_empty: 'revising',
+                verify: 'writing the answer',
+                revise: 'rewriting the query',
+                nudge: 'rewriting the query'}[after] || 'working';
+  w.innerHTML = `<span class="dot"></span><span>${esc(next)}… ${secs}s</span>`;
+  $('steps').appendChild(w);            // keep it last
+}
+function clearWorking(){ const w = $('working'); if(w) w.remove(); }
 
 function step(name, dotClass, meta, detailHtml){
   const d = document.createElement('div');
@@ -153,11 +334,19 @@ function ask(){
   $('sql').textContent = '—';
   $('table').innerHTML = '—'; $('table').className = 'empty';
   $('totals').innerHTML = ''; $('go').disabled = true;
+  graphReset(); clearWorking();
 
   source = new EventSource('/api/ask?q=' + encodeURIComponent(q));
 
+  source.addEventListener('tick', e => {
+    const t = JSON.parse(e.data);
+    showWorking(t.after, t.secs);
+  });
+
   source.addEventListener('node', e => {
     const v = JSON.parse(e.data);
+    clearWorking();
+    graphVisit(v.node);
     const u = v.usage ? `${v.usage.model} · ${v.usage.in}→${v.usage.out} tok · ${v.usage.secs}s` : '';
     if(v.node === 'write_sql'){
       step(`write_sql (attempt ${v.attempt})`, '', u, `<pre>${esc(v.sql)}</pre>`);
@@ -183,6 +372,9 @@ function ask(){
 
   source.addEventListener('done', e => {
     const d = JSON.parse(e.data);
+    clearWorking();
+    graphVisit('__end__');
+    document.querySelectorAll('.gnode.active').forEach(n => n.classList.remove('active'));
     $('answer').textContent = d.answer || '—';
     $('answer').className = 'answer';
     if(d.sql) $('sql').textContent = d.sql;
@@ -199,6 +391,7 @@ function ask(){
   source.addEventListener('error', e => {
     let msg = 'stream error';
     try { msg = JSON.parse(e.data).error; } catch(_){}
+    clearWorking();
     step('error', 'bad', '', `<div class="detail">${esc(msg)}</div>`);
     $('answer').textContent = '—'; $('go').disabled = false;
     if(source) source.close();

@@ -370,14 +370,35 @@ def build_graph():
         g.add_node(name, fn)
 
     g.add_edge(START, "write_sql")
-    g.add_conditional_edges("write_sql", after_write)
+    # The path maps are not decoration: without them LangGraph cannot know
+    # where a router might go (it is an arbitrary function), so the compiled
+    # graph is undrawable and the structure lives only in your head. Declaring
+    # the targets makes get_graph() truthful — the diagram in the UI is
+    # generated from the real graph, so it cannot drift from this file.
+    g.add_conditional_edges("write_sql", after_write,
+                            {"nudge": "nudge", "revise": "revise",
+                             "execute": "execute", "answer": "answer"})
     g.add_edge("nudge", "write_sql")
-    g.add_conditional_edges("execute", after_execute)
-    g.add_conditional_edges("diagnose_empty", after_diagnose)
-    g.add_conditional_edges("verify", after_verify)
+    g.add_conditional_edges("execute", after_execute,
+                            {"verify": "verify", "diagnose_empty": "diagnose_empty",
+                             "revise": "revise", "answer": "answer"})
+    g.add_conditional_edges("diagnose_empty", after_diagnose,
+                            {"revise": "revise", "answer": "answer"})
+    g.add_conditional_edges("verify", after_verify,
+                            {"revise": "revise", "answer": "answer"})
     g.add_edge("revise", "write_sql")
     g.add_edge("answer", END)
     return g.compile()
+
+
+def structure() -> dict:
+    """Nodes and edges of the compiled graph, for the UI to draw."""
+    g = APP.get_graph()
+    return {
+        "nodes": [n for n in g.nodes],
+        "edges": [{"source": e.source, "target": e.target,
+                   "conditional": bool(e.conditional)} for e in g.edges],
+    }
 
 
 APP = build_graph()

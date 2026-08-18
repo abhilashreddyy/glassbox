@@ -9,6 +9,9 @@ model call.
 """
 
 import json
+import queue
+import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -36,6 +39,13 @@ def meta():
             "data_mode": db.build(), "examples": EXAMPLES}
 
 
+@app.get("/api/graph")
+def graph_structure():
+    """Nodes and edges of the compiled graph — the UI draws this, so the
+    diagram is generated from the real graph and cannot drift from the code."""
+    return graph.structure()
+
+
 EXAMPLES = [
     "What is the total revenue from delivered orders?",
     "Which product category has the worst average review score?",
@@ -43,6 +53,7 @@ EXAMPLES = [
     "What is the average delivery delay in days versus the estimate?",
     "Which payment type is most common, and what share of orders is it?",
     "Monthly revenue for 2018",
+    "How much revenue came from customers in Lisbon?",
 ]
 
 
@@ -57,24 +68,53 @@ def ask(q: str):
     def gen():
         totals = {"in": 0, "out": 0, "secs": 0.0, "llm_calls": 0}
         final = {}
-        try:
-            yield _sse("start", {"question": q})
-            for node, update in graph.stream(q):
-                for ev in update.get("events", []):
-                    u = ev.get("usage")
-                    if u:
-                        totals["in"] += u.get("in", 0)
-                        totals["out"] += u.get("out", 0)
-                        totals["secs"] += u.get("secs", 0)
-                        totals["llm_calls"] += 1
-                    yield _sse("node", ev)
-                for key in ("sql", "answer", "verdict", "critique"):
-                    if update.get(key) is not None:
-                        final[key] = update[key]
-            yield _sse("done", {**final, "totals": totals})
-        except Exception as e:  # surface failures in the UI, not just the log
-            traceback.print_exc()
-            yield _sse("error", {"error": f"{type(e).__name__}: {e}"})
+
+        # The graph runs in its own thread and posts to a queue, so this
+        # generator can emit a heartbeat while a node is still working.
+        # LangGraph only yields when a node COMPLETES, and a local model can
+        # take a minute — without this the page looks frozen mid-run.
+        bus: queue.Queue = queue.Queue()
+
+        def produce():
+            try:
+                for node, update in graph.stream(q):
+                    bus.put(("node", node, update))
+            except Exception as e:
+                traceback.print_exc()
+                bus.put(("error", None, f"{type(e).__name__}: {e}"))
+            finally:
+                bus.put(None)
+
+        threading.Thread(target=produce, daemon=True).start()
+        yield _sse("start", {"question": q})
+
+        last_node, since = "starting", time.time()
+        while True:
+            try:
+                item = bus.get(timeout=2.0)
+            except queue.Empty:
+                yield _sse("tick", {"after": last_node,
+                                    "secs": round(time.time() - since)})
+                continue
+            if item is None:
+                break
+            kind, node, payload = item
+            if kind == "error":
+                yield _sse("error", {"error": payload})
+                return
+            for ev in payload.get("events", []):
+                u = ev.get("usage")
+                if u:
+                    totals["in"] += u.get("in", 0)
+                    totals["out"] += u.get("out", 0)
+                    totals["secs"] += u.get("secs", 0)
+                    totals["llm_calls"] += 1
+                yield _sse("node", ev)
+            for key in ("sql", "answer", "verdict", "critique"):
+                if payload.get(key) is not None:
+                    final[key] = payload[key]
+            last_node, since = node, time.time()
+        yield _sse("done", {**final, "totals": totals})
 
     return StreamingResponse(
         gen(),
