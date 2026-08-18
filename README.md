@@ -180,6 +180,22 @@ Also observed: a run where the model aliased `order_reviews AS or` — a reserve
 word — DuckDB rejected it, the error fed back, and attempt 2 fixed the alias.
 Error-driven revision works.
 
+## Seeing what the agent did
+
+The web UI streams each step live. To see what the models were actually *sent*
+— the part that explains why a query came out the way it did — replay the trace:
+
+```bash
+.venv/bin/python trace.py        # last run: nodes, then every prompt and reply
+.venv/bin/python trace.py -v     # full prompts, untruncated
+.venv/bin/python trace.py -l     # list saved runs
+```
+
+Traces are written to `traces/` on every run, from the UI and the CLI alike.
+Local files, no service and no account — LangSmith or Langfuse would add hosted
+history and cross-run comparison, but nothing you need to answer "why did it do
+that?" on a single run.
+
 ## Layout
 
 ```

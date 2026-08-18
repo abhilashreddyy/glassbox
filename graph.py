@@ -18,9 +18,11 @@ The order is deliberate: 1–3 are decided by code, and only 4 asks a model.
 Anything the database can settle is settled before an opinion is consulted.
 """
 
+import contextvars
 import json
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Optional, TypedDict
 
@@ -51,6 +53,44 @@ def _load_glossary() -> str:
 
 
 GLOSSARY = _load_glossary()
+
+
+# ── tracing ─────────────────────────────────────────────────────────────────
+# The UI shows WHAT each node did. A trace also records what each model was
+# actually SENT and what it said back verbatim — the only way to answer "why
+# did it write that?" instead of guessing. Kept local: no service, no account,
+# nothing leaves the machine.
+TRACES = ROOT / "traces"
+_TRACE: contextvars.ContextVar = contextvars.ContextVar("trace", default=None)
+
+
+def _trace_start(question: str) -> dict:
+    """A context variable, not a global: the server runs each request in its own
+    thread, and a global would interleave two users' traces."""
+    run = {"question": question,
+           "started": datetime.now().isoformat(timespec="seconds"),
+           "calls": [], "events": []}
+    _TRACE.set(run)
+    return run
+
+
+def _trace_flush(final: dict) -> Path | None:
+    run = _TRACE.get()
+    if run is None:
+        return None
+    run["events"] = final.get("events", [])
+    run["sql"] = final.get("sql")
+    run["answer"] = final.get("answer")
+    run["verdict"] = final.get("verdict")
+    run["attempts"] = final.get("attempts")
+    TRACES.mkdir(exist_ok=True)
+    path = TRACES / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    path.write_text(json.dumps(run, indent=1, default=str))
+    latest = TRACES / "latest.json"
+    latest.unlink(missing_ok=True)
+    latest.write_text(path.read_text())
+    _TRACE.set(None)
+    return path
 
 
 # ── state ───────────────────────────────────────────────────────────────────
@@ -92,6 +132,11 @@ def _call(role: str, system: str, user: str) -> tuple[str, dict]:
     usage = {"model": model_name(role), "in": u.get("input_tokens", 0),
              "out": u.get("output_tokens", 0), "secs": round(time.time() - t0, 2)}
     text = msg.content if isinstance(msg.content, str) else str(msg.content)
+
+    run = _TRACE.get()
+    if run is not None:
+        run["calls"].append({"role": role, "usage": usage,
+                             "system": system, "user": user, "response": text})
     return text.strip(), usage
 
 
@@ -330,14 +375,24 @@ def initial_state(question: str) -> dict:
 
 def ask(question: str) -> dict:
     """Blocking run — used by the eval harness."""
-    return APP.invoke(initial_state(question), {"recursion_limit": 40})
+    _trace_start(question)
+    final = APP.invoke(initial_state(question), {"recursion_limit": 40})
+    _trace_flush(final)
+    return final
 
 
 def stream(question: str):
     """Yield each node's update as it happens — this is what the UI renders."""
+    _trace_start(question)
+    merged: dict = {"events": []}
     for step in APP.stream(initial_state(question), {"recursion_limit": 40}):
         for node, update in step.items():
+            merged["events"].extend(update.get("events", []))
+            for k in ("sql", "answer", "verdict", "attempts"):
+                if update.get(k) is not None:
+                    merged[k] = update[k]
             yield node, update
+    _trace_flush(merged)
 
 
 if __name__ == "__main__":
