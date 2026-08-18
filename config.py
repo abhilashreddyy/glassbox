@@ -42,9 +42,14 @@ def get_model(role: str):
     if provider == "ollama":
         from langchain_ollama import ChatOllama
 
-        # num_ctx matters: Ollama's default window silently truncates long
-        # prompts, and a truncated schema looks exactly like a stupid model.
-        return ChatOllama(model=name, temperature=0.0, num_ctx=16384)
+        # num_ctx matters twice over. Too small and Ollama silently truncates
+        # the prompt, which looks exactly like a stupid model. Too large and
+        # the KV cache costs real memory: measured here, 16384 holds 15 GB
+        # resident against 14 GB at 8192, on a 24 GB machine where that
+        # gigabyte decides whether the run swaps.
+        # Largest real prompt is ~2,100 tokens (sql_writer with the schema,
+        # profile and glossary), so 8192 is ~3.5x headroom.
+        return ChatOllama(model=name, temperature=0.0, num_ctx=8192)
 
     if provider == "openai":
         from langchain_openai import ChatOpenAI  # pip install langchain-openai
