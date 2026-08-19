@@ -5,6 +5,7 @@ A model is named "<provider>:<model>", e.g.
     openrouter:qwen/qwen3.8-27b           any hosted model, one key
     openrouter:deepseek/deepseek-v4-flash
     openrouter:google/gemini-3.7-flash
+    bedrock:qwen.qwen3-32b-v1:0           AWS, cheapest hosted Qwen
     openai:gpt-5-mini
     anthropic:claude-sonnet-5
 
@@ -87,6 +88,20 @@ def get_model(role: str):
             temperature=0.0,
             base_url="https://openrouter.ai/api/v1",
             api_key=key,
+        )
+
+    if provider == "bedrock":
+        # Bedrock's Converse API normalises across model families, so one
+        # class covers Qwen, Llama, Claude and the rest. Region matters:
+        # the Qwen3 catalogue is not in every region (us-west-2 has the
+        # widest coverage). Auth comes from the normal AWS chain — no key
+        # in this file.
+        from langchain_aws import ChatBedrockConverse  # pip install langchain-aws
+
+        return ChatBedrockConverse(
+            model=name,
+            temperature=0.0,
+            region_name=os.environ.get("AWS_REGION", "us-west-2"),
         )
 
     if provider == "anthropic":
