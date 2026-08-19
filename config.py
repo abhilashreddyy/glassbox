@@ -1,9 +1,16 @@
 """Model routing — every node can run on a different model.
 
 A model is named "<provider>:<model>", e.g.
-    ollama:gpt-oss:20b
-    openai:gpt-4o-mini
+    ollama:gpt-oss:20b                    local, free
+    openrouter:qwen/qwen3.8-27b           any hosted model, one key
+    openrouter:deepseek/deepseek-v4-flash
+    openrouter:google/gemini-3.7-flash
+    openai:gpt-5-mini
     anthropic:claude-sonnet-5
+
+`openrouter` is the useful one for this project: a single key reaches open
+models, OpenAI, Anthropic and Google alike, so comparing them per role is an
+env-var change rather than an integration.
 
 Three roles, because they have genuinely different difficulty:
     sql_writer  — the hard one. Needs schema reasoning + correct SQL.
@@ -21,13 +28,18 @@ question rather than a guess — swap one role, rerun the eval, compare.
 import os
 from functools import lru_cache
 
-DEFAULT = os.environ.get("DATA_AGENT_MODEL_DEFAULT", "ollama:gpt-oss:20b")
+FALLBACK = "ollama:gpt-oss:20b"
 
 ROLES = ("sql_writer", "verifier", "answerer")
 
 
 def model_name(role: str) -> str:
-    return os.environ.get(f"DATA_AGENT_MODEL_{role.upper()}", DEFAULT)
+    """Resolved per call, not at import: a test or a sweep that sets the env
+    var after importing this module should still take effect."""
+    return os.environ.get(
+        f"DATA_AGENT_MODEL_{role.upper()}",
+        os.environ.get("DATA_AGENT_MODEL_DEFAULT", FALLBACK),
+    )
 
 
 @lru_cache(maxsize=None)
@@ -56,12 +68,36 @@ def get_model(role: str):
 
         return ChatOpenAI(model=name, temperature=0.0)
 
+    if provider == "openrouter":
+        # OpenRouter speaks the OpenAI wire format, so the same adapter works —
+        # only the base URL and key differ. Needs OPENROUTER_API_KEY.
+        from langchain_openai import ChatOpenAI
+
+        key = os.environ.get("OPENROUTER_API_KEY")
+        if not key:
+            # The OpenAI SDK's own message names OPENAI_API_KEY here, which
+            # sends you looking in the wrong place.
+            raise RuntimeError(
+                f"{spec} needs OPENROUTER_API_KEY. Get one at "
+                "https://openrouter.ai/keys, then: "
+                'echo \'export OPENROUTER_API_KEY="sk-or-..."\' >> ~/.zshrc'
+            )
+        return ChatOpenAI(
+            model=name,
+            temperature=0.0,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=key,
+        )
+
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic  # pip install langchain-anthropic
 
         return ChatAnthropic(model=name, temperature=0.0)
 
-    raise ValueError(f"unknown provider {provider!r} in {spec!r}")
+    raise ValueError(
+        f"unknown provider {provider!r} in {spec!r} — "
+        "expected ollama, openrouter, openai or anthropic"
+    )
 
 
 def active_models() -> dict:
