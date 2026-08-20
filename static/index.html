@@ -350,6 +350,12 @@ function ask(){
     const u = v.usage ? `${v.usage.model} · ${v.usage.in}→${v.usage.out} tok · ${v.usage.secs}s` : '';
     if(v.node === 'write_sql'){
       step(`write_sql (attempt ${v.attempt})`, '', u, `<pre>${esc(v.sql)}</pre>`);
+      // Show any deterministic repair applied to the model's SQL. Silently
+      // rewriting what the model wrote would undercut the whole glass box.
+      for(const r of (v.repairs || []))
+        step('repair', 'warn', '', `<div class="detail">${esc(r)}</div>`);
+      for(const p of (v.precheck || []))
+        step('precheck', 'warn', '', `<div class="detail">${esc(p)}</div>`);
       $('sql').textContent = v.sql;
     } else if(v.node === 'execute'){
       step('execute', v.ok ? 'ok' : 'bad',

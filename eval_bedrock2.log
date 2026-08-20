@@ -1,0 +1,23 @@
+  PASS  revenue_delivered      3.1s  verify=ok  attempts=0
+  PASS  delivered_count        1.1s  verify=ok  attempts=0
+  PASS  worst_category         6.1s  verify=ok  attempts=1
+  PASS  top5_states            1.7s  verify=ok  attempts=0
+  PASS  avg_review             3.2s  verify=ok  attempts=1
+  PASS  common_payment         2.3s  verify=ok  attempts=0
+  PASS  seller_count           3.1s  verify=ok  attempts=0
+  PASS  freight_delivered      1.8s  verify=ok  attempts=0
+  PASS  avg_delivery_days      2.0s  verify=ok  attempts=0
+  PASS  pct_late               4.8s  verify=ok  attempts=1
+  PASS  top_category_revenue   3.5s  verify=ok  attempts=0
+  PASS  best_month             2.8s  verify=ok  attempts=0
+  PASS  late_review_score      3.6s  verify=ok  attempts=1
+  FAIL  repeat_customers       7.1s  verify=bad  attempts=3
+  PASS  top_seller_state       2.0s  verify=ok  attempts=0
+  PASS  avg_items_per_order    1.7s  verify=ok  attempts=0
+  PASS  pct_reviews_with_text   2.4s  verify=ok  attempts=0
+
+============================================================
+questions 17   runs 17   elapsed 53s
+accuracy  16/17 = 94.1%
+pass^1    16/17 = 94.1%   (correct on every run)
+not always correct: repeat_customers

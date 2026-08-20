@@ -16,6 +16,7 @@ Two entry points:
 
 import re
 from datetime import date, datetime
+from functools import lru_cache
 
 import sqlglot
 from sqlglot import exp
@@ -73,6 +74,64 @@ def precheck_sql(sql: str) -> list[str]:
                     f"(SELECT max({column}) FROM {table})."
                 )
     return problems
+
+
+@lru_cache(maxsize=1)
+def _reserved_words() -> frozenset:
+    """DuckDB's own reserved-word list, asked of DuckDB.
+
+    A hand-maintained list would be wrong the day the engine adds a keyword,
+    and wrong for anyone on a different version. `duckdb_keywords()` is the
+    authority, so ask it.
+    """
+    r = tools.run_sql(
+        "SELECT keyword_name FROM duckdb_keywords() "
+        "WHERE keyword_category = 'reserved'"
+    )
+    if not r.get("ok"):
+        return frozenset()
+    return frozenset(row[0].lower() for row in r["rows"])
+
+
+def repair_sql(sql: str) -> tuple[str, list[str]]:
+    """Fix mechanical breakage the model cannot learn from an error message.
+
+    Observed: a model aliased a CTE `do` — the natural short form of
+    `delivered_orders`, and a reserved keyword. DuckDB reports only
+    `syntax error at or near "do"`, which does not say *why*, so the revise
+    loop burned every attempt reproducing the same alias.
+
+    Renaming an alias cannot change what a query means, so there is nothing to
+    consult the model about: repair it and carry on. The rename is recorded in
+    the event stream — a silent rewrite of the model's SQL would undermine the
+    point of the whole project.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=DIALECT)   # sqlglot is laxer than DuckDB
+    except Exception:
+        return sql, []
+
+    reserved = _reserved_words()
+    renames = {
+        t.alias.lower(): f"{t.alias}_t"
+        for t in tree.find_all(exp.Table)
+        if t.alias and t.alias.lower() in reserved
+    }
+    if not renames:
+        return sql, []
+
+    for tbl in tree.find_all(exp.Table):                     # the definitions
+        if tbl.alias and tbl.alias.lower() in renames:
+            tbl.set("alias",
+                    exp.TableAlias(this=exp.to_identifier(renames[tbl.alias.lower()])))
+    for col in tree.find_all(exp.Column):                    # every qualified use
+        qualifier = col.args.get("table")
+        if qualifier and qualifier.name.lower() in renames:
+            col.set("table", exp.to_identifier(renames[qualifier.name.lower()]))
+
+    notes = [f"renamed alias `{k}` to `{v}` — `{k}` is a reserved SQL keyword"
+             for k, v in renames.items()]
+    return tree.sql(dialect=DIALECT), notes
 
 
 STRIP = ("group", "having", "order", "limit", "offset", "distinct",

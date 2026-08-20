@@ -199,6 +199,11 @@ def write_sql(state: S) -> dict:
                         "\n".join(parts))
     sql = _extract_sql(text)
 
+    # Repair before judging. A reserved-word alias is mechanical breakage the
+    # model cannot learn from DuckDB's error, and renaming it cannot change
+    # what the query means — so fix it rather than spending a retry.
+    sql, repairs = checks.repair_sql(sql)
+
     # Deterministic gate: catch a query that cannot match before spending a
     # database round trip and, more importantly, before the result gets
     # rationalised downstream.
@@ -208,7 +213,8 @@ def write_sql(state: S) -> dict:
         "pending": problems or None,
         "events": [_ev("write_sql", sql=sql, usage=usage,
                        attempt=state.get("attempts", 0) + 1,
-                       precheck=problems or None)],
+                       precheck=problems or None,
+                       repairs=repairs or None)],
     }
 
 
