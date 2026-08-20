@@ -141,20 +141,41 @@ def diagnose(sql: str) -> dict:
         for p in rest:
             merged = p.copy() if merged is None else exp.And(this=merged, expression=p.copy())
         n = _count(_row_probe(tree, merged))
+
+        # Also ask what this condition matches ON ITS OWN. Zero means the value
+        # simply is not in the data — `city = 'Lisbon'` against a Brazilian
+        # dataset. That is unfixable, and telling the model to "fix the filter"
+        # burns every retry on a question no rewrite can answer. Non-zero means
+        # the condition is fine alone and only fails in combination, which IS
+        # worth rewriting.
+        alone = _count(_row_probe(tree, dropped))
         text = dropped.sql(dialect=DIALECT)
-        findings.append({"dropped": text, "rows_without_it": n})
+        findings.append({"dropped": text, "rows_without_it": n,
+                         "rows_matching_it_alone": alone})
         if n:                                  # rows appear once this one is gone
-            culprits.append({"condition": text, "rows_without_it": n})
+            culprits.append({"condition": text, "rows_without_it": n,
+                             "value_absent": alone == 0})
 
     if culprits:
         worst = max(culprits, key=lambda c: c["rows_without_it"])
-        summary = (
-            f"The result is empty because of `{worst['condition']}` — without it "
-            f"{worst['rows_without_it']:,} rows match. Every other filter is fine."
-            if len(culprits) == 1 else
-            f"Removing any of {len(culprits)} conditions brings rows back; the "
-            f"biggest is `{worst['condition']}` ({worst['rows_without_it']:,} rows)."
-        )
+        if worst["value_absent"]:
+            summary = (
+                f"Nothing in the data matches `{worst['condition']}` at all — not "
+                f"in combination, and not on its own. The value asked for does "
+                f"not exist here. ({worst['rows_without_it']:,} rows match every "
+                f"other filter.)"
+            )
+        elif len(culprits) == 1:
+            summary = (
+                f"The result is empty because of `{worst['condition']}` — without "
+                f"it {worst['rows_without_it']:,} rows match. Every other filter "
+                f"is fine."
+            )
+        else:
+            summary = (
+                f"Removing any of {len(culprits)} conditions brings rows back; the "
+                f"biggest is `{worst['condition']}` ({worst['rows_without_it']:,} rows)."
+            )
     else:
         summary = (
             f"No single filter is at fault — the combination genuinely matches "

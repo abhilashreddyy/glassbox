@@ -247,13 +247,22 @@ def diagnose_empty(state: S) -> dict:
     """
     d = checks.diagnose(state["sql"])
     pending = None
-    if d.get("culprits"):
-        worst = max(d["culprits"], key=lambda c: c["rows_without_it"])
-        pending = [f"The result was empty. Diagnosis: removing "
-                   f"`{worst['condition']}` yields {worst['rows_without_it']:,} "
-                   f"rows, so that filter is wrong or too narrow. Fix it — do "
-                   f"not simply drop it unless the question truly does not ask "
-                   f"for it."]
+    culprits = d.get("culprits") or []
+    if culprits:
+        worst = max(culprits, key=lambda c: c["rows_without_it"])
+        # If the value is absent from the data entirely, no rewrite can help —
+        # leave `pending` unset so the router goes straight to `answer` and the
+        # user is told the truth instead of watching three failed retries.
+        if not worst["value_absent"]:
+            # State the measurement, not a verdict. The filter may well be
+            # exactly what was asked for; only the model knows the intent.
+            pending = [f"The result was empty. Measured: with "
+                       f"`{worst['condition']}` removed, "
+                       f"{worst['rows_without_it']:,} rows match; that condition "
+                       f"matches {worst['rows_matching_it_alone']:,} rows on its "
+                       f"own. Decide whether it is mis-scoped (wrong column, "
+                       f"wrong granularity, wrong range) and correct it. Keep it "
+                       f"if the question genuinely requires it."]
     return {"diagnosis": d, "pending": pending,
             "events": [_ev("diagnose_empty", summary=d.get("summary"),
                            conditions=d.get("conditions"))]}
