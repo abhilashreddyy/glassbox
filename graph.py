@@ -84,11 +84,16 @@ def _trace_flush(final: dict) -> Path | None:
     run["verdict"] = final.get("verdict")
     run["attempts"] = final.get("attempts")
     TRACES.mkdir(exist_ok=True)
-    path = TRACES / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    path.write_text(json.dumps(run, indent=1, default=str))
-    latest = TRACES / "latest.json"
-    latest.unlink(missing_ok=True)
-    latest.write_text(path.read_text())
+    # Microseconds, not seconds: two runs finishing in the same second would
+    # silently overwrite each other, and a hosted model answers in ~1.5s.
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    path = TRACES / f"{stamp}.json"
+    body = json.dumps(run, indent=1, default=str)
+    path.write_text(body)
+    # `latest.json` is a single-user convenience for `trace.py` with no
+    # argument. With concurrent users the last finisher wins — which is why
+    # trace.py can also be given an explicit path.
+    (TRACES / "latest.json").write_text(body)
     _TRACE.set(None)
     return path
 
