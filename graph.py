@@ -179,7 +179,8 @@ Rules:
 - The schema lists each column's actual VALUES and RANGES — use them. Never
   filter on a value that is not in the data.
 - Prefer explicit JOINs. Alias aggregates with clear names (e.g. AS total_revenue).
-- Never alias a table with a reserved word (or, is, in, as...).
+- End every table alias with an underscore (o_, oi_, do_). This makes a
+  collision with a reserved SQL keyword impossible.
 - Add ORDER BY and LIMIT when the question asks for "top"/"worst"/"best" N.
 
 DEFINITIONS — these are the house meanings of business terms. Follow them

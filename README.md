@@ -35,18 +35,23 @@ never broken. So the engineering went into the checks, not the prompt.
 
 ## Results
 
-Execution accuracy on 17 hand-written gold questions, all three roles on local
-`gpt-oss:20b`:
+Execution accuracy on 17 hand-written gold questions, real Olist data.
 
-| Configuration | Accuracy |
-|---|---|
-| Schema only (8 questions) | 7/8 — 87.5% |
-| Schema only (17 questions) | 14/17 — 82.4% |
-| **+ value profiles, glossary, deterministic checks** | **17/17 — 100%** |
+| Configuration | Accuracy | Wall clock | Cost |
+|---|---|---|---|
+| `gpt-oss:20b` local, schema only (8 questions) | 7/8 — 87.5% | — | $0 |
+| `gpt-oss:20b` local, schema only | 14/17 — 82.4% | — | $0 |
+| **`gpt-oss:20b` local, full grounding** | **17/17 — 100%** | 548s | $0 |
+| `qwen3-32b` on Bedrock, before alias repair | 13/17 — 76.5% | 46s | $0.015 |
+| **`qwen3-32b` on Bedrock, after alias repair** | **16/17 — 94.1%** | **53s** | **$0.015** |
 
-### Read that 100% with suspicion
+A local 20B is *more accurate* than a hosted 32B here; the hosted one is **10x
+faster** for a cent and a half. Neither is strictly better — which is why each
+node resolves its own model.
 
-Three of the seventeen were failing until three glossary entries were added,
+### Read the 100% with suspicion
+
+Three of those seventeen were failing until three glossary entries were added,
 written *after seeing exactly which questions failed and why*. That is fitting to
 the test set, and a number produced that way does not measure how the agent
 handles a question it has never seen.
@@ -56,7 +61,42 @@ it.** The clean measurement is a held-out set — written without looking at any
 failure, run once. Until then, 100% means "the known failure modes are closed",
 not "accuracy".
 
-That distinction is the point of the project.
+### The alias repair: 13/17 → 16/17
+
+Qwen aliased a CTE `do` — the natural short form of `delivered_orders`, and a
+reserved SQL keyword. DuckDB reports only `syntax error at or near "do"`, which
+never says *why*, so the revise loop burned all four attempts reproducing the
+same alias. Three questions failed this way.
+
+The prompt already said *"never alias a table with a reserved word"* with
+examples. The model did not generalise from them — the same lesson as the revenue
+glossary: **a rule in a prompt is a suggestion.**
+
+Two changes, at both ends:
+
+- **Prevention** — the prompt now asks for a trailing underscore on every alias
+  (`o_`, `do_`), which makes a keyword collision impossible by construction.
+- **Repair** — reserved words come from `duckdb_keywords()` (nothing hardcoded,
+  nothing to go stale), and sqlglot renames any offending alias and every
+  qualified reference *before* the query runs.
+
+Renaming an alias cannot change what a query means, so there is nothing to
+consult the model about: no retry, no extra model call. The rename is recorded in
+the event stream rather than applied silently — a glass box that quietly rewrites
+its own inputs would be worse than one that fails honestly.
+
+All three questions now pass with **zero** retries.
+
+### The last failure is the verifier working
+
+`repeat_customers` asks how many customers placed more than one order. Gold is
+2,997. Qwen returned **0** three times: it knew from the glossary that it needed
+`customer_unique_id`, but never worked out that the column lives on `customers`
+and requires a join, so it grouped `orders.customer_id` — unique per order.
+
+The verifier rejected all three, each time with an accurate reason, **without
+ever seeing the gold answer**. A confident "0 repeat customers" would otherwise
+have shipped. `gpt-oss:20b` answers this one correctly.
 
 ## What the failures taught
 
