@@ -8,8 +8,9 @@ model call.
     .venv/bin/python server.py      →  http://127.0.0.1:8000
 """
 
+import asyncio
 import json
-import queue
+import os
 import threading
 import time
 import traceback
@@ -24,6 +25,21 @@ from config import active_models
 
 ROOT = Path(__file__).resolve().parent
 app = FastAPI(title="data-agent")
+
+# A run is long (seconds to minutes of model calls) and mostly waiting. Two
+# limits keep it from harming a host application it is mounted into:
+#
+#   MAX_CONCURRENT  caps how many runs exist at once, so the process cannot
+#                   accumulate unbounded threads and model spend.
+#   RUN_TIMEOUT_S   caps wall clock, so one wedged model call cannot hold a
+#                   slot forever.
+#
+# The endpoint itself is `async def`: a sync endpoint would occupy one of
+# anyio's 40 shared threadpool slots for the whole run, and 40 concurrent
+# questions would stall every other endpoint in the host app.
+MAX_CONCURRENT = int(os.environ.get("GLASSBOX_MAX_CONCURRENT", "4"))
+RUN_TIMEOUT_S = float(os.environ.get("GLASSBOX_RUN_TIMEOUT", "300"))
+_slots = asyncio.Semaphore(MAX_CONCURRENT)
 
 
 @app.get("/")
@@ -62,59 +78,71 @@ def _sse(event: str, payload: dict) -> str:
 
 
 @app.get("/api/ask")
-def ask(q: str):
-    """Server-sent events, one per graph node as it finishes."""
+async def ask(q: str):
+    """Server-sent events, one per graph node as it finishes.
 
-    def gen():
+    The graph is blocking, so it runs on its own thread and hands results back
+    through an asyncio.Queue via call_soon_threadsafe. The consumer here is
+    pure async — it never occupies a threadpool slot, which is what makes this
+    safe to mount alongside other APIs.
+    """
+
+    async def gen():
+        loop = asyncio.get_running_loop()
+        bus: asyncio.Queue = asyncio.Queue()
         totals = {"in": 0, "out": 0, "secs": 0.0, "llm_calls": 0}
-        final = {}
-
-        # The graph runs in its own thread and posts to a queue, so this
-        # generator can emit a heartbeat while a node is still working.
-        # LangGraph only yields when a node COMPLETES, and a local model can
-        # take a minute — without this the page looks frozen mid-run.
-        bus: queue.Queue = queue.Queue()
+        final: dict = {}
 
         def produce():
             try:
                 for node, update in graph.stream(q):
-                    bus.put(("node", node, update))
+                    loop.call_soon_threadsafe(bus.put_nowait, ("node", node, update))
             except Exception as e:
                 traceback.print_exc()
-                bus.put(("error", None, f"{type(e).__name__}: {e}"))
+                loop.call_soon_threadsafe(
+                    bus.put_nowait, ("error", None, f"{type(e).__name__}: {e}")
+                )
             finally:
-                bus.put(None)
+                loop.call_soon_threadsafe(bus.put_nowait, None)
 
-        threading.Thread(target=produce, daemon=True).start()
-        yield _sse("start", {"question": q})
+        if _slots.locked() and _slots._value <= 0:
+            yield _sse("tick", {"after": "queued", "secs": 0})
 
-        last_node, since = "starting", time.time()
-        while True:
-            try:
-                item = bus.get(timeout=2.0)
-            except queue.Empty:
-                yield _sse("tick", {"after": last_node,
-                                    "secs": round(time.time() - since)})
-                continue
-            if item is None:
-                break
-            kind, node, payload = item
-            if kind == "error":
-                yield _sse("error", {"error": payload})
-                return
-            for ev in payload.get("events", []):
-                u = ev.get("usage")
-                if u:
-                    totals["in"] += u.get("in", 0)
-                    totals["out"] += u.get("out", 0)
-                    totals["secs"] += u.get("secs", 0)
-                    totals["llm_calls"] += 1
-                yield _sse("node", ev)
-            for key in ("sql", "answer", "verdict", "critique"):
-                if payload.get(key) is not None:
-                    final[key] = payload[key]
-            last_node, since = node, time.time()
-        yield _sse("done", {**final, "totals": totals})
+        async with _slots:
+            threading.Thread(target=produce, daemon=True).start()
+            yield _sse("start", {"question": q})
+
+            started = time.time()
+            last_node, since = "starting", time.time()
+            while True:
+                if time.time() - started > RUN_TIMEOUT_S:
+                    yield _sse("error", {"error": f"run exceeded {RUN_TIMEOUT_S:.0f}s"})
+                    return
+                try:
+                    item = await asyncio.wait_for(bus.get(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    yield _sse("tick", {"after": last_node,
+                                        "secs": round(time.time() - since)})
+                    continue
+                if item is None:
+                    break
+                kind, node, payload = item
+                if kind == "error":
+                    yield _sse("error", {"error": payload})
+                    return
+                for ev in payload.get("events", []):
+                    u = ev.get("usage")
+                    if u:
+                        totals["in"] += u.get("in", 0)
+                        totals["out"] += u.get("out", 0)
+                        totals["secs"] += u.get("secs", 0)
+                        totals["llm_calls"] += 1
+                    yield _sse("node", ev)
+                for key in ("sql", "answer", "verdict", "critique"):
+                    if payload.get(key) is not None:
+                        final[key] = payload[key]
+                last_node, since = node, time.time()
+            yield _sse("done", {**final, "totals": totals})
 
     return StreamingResponse(
         gen(),
